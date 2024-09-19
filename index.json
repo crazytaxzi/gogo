@@ -1,7 +1,7 @@
 {
     "name": "GoGoLoco Senti's Repo",
     "author": "franada",
-    "url": "https://wholesomevr.github.io/SPS-Configurator/index.json",
+    "url": "https://github.com/crazytaxzi/gogo/blob/main/index.json",
     "id": "GoGoLocoSentiRepo.listing",
     "packages": {
       "GoGoLoco.SentiRepo": {
