@@ -9,7 +9,7 @@
           "1.8.6": {
             "name": "GoGoloco",
             "displayName": "GoGoLoco",
-            "version": "1.8.6",
+            "version": "GoLoco.v.1.8.6",
             "unity": "2022.3.22f1",
             "description": "Gogoloco for your avatars locomotion needs",
             "gitDependencies": {},
