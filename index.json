@@ -1,0 +1,28 @@
+{
+    "name": "GoGoLoco Senti's Repo",
+    "author": "franada",
+    "url": "https://wholesomevr.github.io/SPS-Configurator/index.json",
+    "id": "GoGoLocoSentiRepo.listing",
+    "packages": {
+      "GoGoLoco.SentiRepo": {
+        "versions": {
+          "1.8.6": {
+            "name": "Gogoloco.Franada.186",
+            "displayName": "GoGoLoco",
+            "version": "1.8.6",
+            "unity": "2022.3.22f1",
+            "description": "Gogoloco for your avatars locomotion needs",
+            "gitDependencies": {},
+            "vpmDependencies": {
+              "com.vrchat.avatars": "3.*"
+            },
+            "author": {
+              "name": "Gogoloco",
+              "email": "",
+              "url": "https://franadavrc.gumroad.com/l/gogoloco"
+            },
+            "zipSHA256": "7729294D867E5C3E6791EC242ACCA7B1F85E3BA70C77C40C70C77B516BCB5E94",
+            "url": "https://github.com/crazytaxzi/gogo/releases/download/release/GoLoco.v.1.8.6.zip",
+            "legacyFolders": {},
+            "legacyFiles": {}
+          },
