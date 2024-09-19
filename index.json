@@ -1,7 +1,7 @@
 {
     "name": "GoGoLoco Senti's Repo",
     "author": "franada",
-    "url": "https://github.com/crazytaxzi/gogo/index.json",
+    "url": "https://github.com/crazytaxzi/gogo/blob/main/index.json",
     "id": "GoGoLocoSentiRepo.listing",
     "packages": {
       "GoGoLoco.SentiRepo": {
@@ -25,4 +25,8 @@
             "url": "https://github.com/crazytaxzi/gogo/releases/download/release/GoLoco.v.1.8.6.zip",
             "legacyFolders": {},
             "legacyFiles": {}
-          },
+          }
+      }
+    }
+  }
+}
