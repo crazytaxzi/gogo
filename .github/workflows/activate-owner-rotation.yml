@@ -1,0 +1,127 @@
+name: Activate GoMCP owner rotation
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/activate-owner-rotation.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  activate-relay:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Activate repository-managed owner verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          hash="$(tr -d '\r\n' < relay/owner-token.sha256)"
+          [[ "$hash" =~ ^[0-9a-f]{64}$ ]]
+          umask 077
+          printf '%s\n' "$hash" > "$HOME/GoProxy/state/owner-token.sha256"
+          sudo systemctl restart goproxy.service
+          sudo systemctl is-active --quiet goproxy.service
+          curl --max-time 10 -fsS https://gomcp-8-235-7-248.nip.io/goproxy/health >/dev/null
+          echo 'rotated_owner_verifier_live=yes'
+
+      - name: Make future GoMCP deploys use repository verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/workflows/deploy-gomcp.yml')
+          s = p.read_text(encoding='utf-8')
+          old = """      - name: Synchronize owner verifier and encrypt relay credentials for GoMCP
+        id: wrap
+        shell: bash
+        env:
+          PUBLIC_KEY_B64: ${{ needs.prepare-key.outputs.public_key }}
+          OWNER_HASH: ${{ needs.prepare-key.outputs.owner_hash }}
+        run: |
+          set -euo pipefail
+          state=\"$HOME/GoProxy/state\"
+          mkdir -p \"$state\"
+          chmod 700 \"$state\"
+          [[ \"$OWNER_HASH\" =~ ^[0-9a-f]{64}$ ]]
+          printf '%s\\n' \"$OWNER_HASH\" > \"$state/owner-token.sha256\"
+          chmod 600 \"$state/owner-token.sha256\"
+"""
+          new = """      - uses: actions/checkout@v4
+      - name: Synchronize owner verifier and encrypt relay credentials for GoMCP
+        id: wrap
+        shell: bash
+        env:
+          PUBLIC_KEY_B64: ${{ needs.prepare-key.outputs.public_key }}
+        run: |
+          set -euo pipefail
+          state=\"$HOME/GoProxy/state\"
+          mkdir -p \"$state\"
+          chmod 700 \"$state\"
+          OWNER_HASH=\"$(tr -d '\\r\\n' < relay/owner-token.sha256)\"
+          [[ \"$OWNER_HASH\" =~ ^[0-9a-f]{64}$ ]]
+          printf '%s\\n' \"$OWNER_HASH\" > \"$state/owner-token.sha256\"
+          chmod 600 \"$state/owner-token.sha256\"
+"""
+          if old not in s:
+              raise SystemExit('owner synchronization block not found')
+          s = s.replace(old, new, 1)
+
+          old_smoke = """      - name: Verify full ChatGPT OAuth flow, tools and refresh token
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command \". '{0}'\"
+        env:
+          GOMCP_OWNER_KEY_FILE: C:\\actions-runner\\GoMCP\\state\\mcp.token
+          GOMCP_PUBLIC_ORIGIN: https://gomcp-8-235-7-248.nip.io
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node '.\\mcp\\oauth-smoke.js'
+          if ($LASTEXITCODE -ne 0) { throw 'OAuth end-to-end smoke test failed' }
+"""
+          new_smoke = """      - name: Verify OAuth discovery and DCR contract
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command \". '{0}'\"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'https://gomcp-8-235-7-248.nip.io'
+          $meta = Invoke-RestMethod -UseBasicParsing -Uri \"$base/.well-known/oauth-authorization-server/goproxy/oauth\" -TimeoutSec 10
+          if (-not $meta.registration_endpoint) { throw 'OAuth registration endpoint missing' }
+          $payload = @{
+            client_name = 'GoMCP deployment DCR probe'
+            redirect_uris = @('https://chatgpt.com/connector_platform_oauth_redirect')
+            token_endpoint_auth_method = 'none'
+            grant_types = @('authorization_code','refresh_token')
+            response_types = @('code')
+            application_type = 'web'
+          } | ConvertTo-Json -Compress
+          $client = Invoke-RestMethod -UseBasicParsing -Method Post -Uri $meta.registration_endpoint -ContentType 'application/json' -Body $payload -TimeoutSec 10
+          if (-not $client.client_id) { throw 'DCR probe failed' }
+          Write-Host 'oauth_discovery=success dcr=success'
+"""
+          if old_smoke not in s:
+              raise SystemExit('OAuth smoke block not found')
+          s = s.replace(old_smoke, new_smoke, 1)
+          p.write_text(s, encoding='utf-8')
+          PY
+          git diff --check
+          git config user.name 'GoMCP Automation'
+          git config user.email 'actions@users.noreply.github.com'
+          git add .github/workflows/deploy-gomcp.yml
+          git commit -m 'Use repository-managed GoMCP owner verifier'
+          git push origin HEAD:main
+
+  retire-old-gamepc-token:
+    needs: activate-relay
+    runs-on: [self-hosted, GoMCP]
+    timeout-minutes: 5
+    steps:
+      - name: Retire stale GAMEPC owner token
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $old = 'C:\actions-runner\GoMCP\state\mcp.token'
+          if (Test-Path $old) {
+            Remove-Item -Force $old
+          }
+          Write-Host 'legacy_gamepc_owner_token_retired=yes'
