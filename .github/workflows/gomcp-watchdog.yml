@@ -1,0 +1,62 @@
+name: GoMCP watchdog
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gomcp-watchdog
+  cancel-in-progress: true
+
+jobs:
+  watchdog:
+    runs-on: [self-hosted, GoMCP]
+    timeout-minutes: 5
+    steps:
+      - name: Ensure GoMCP supervisor is alive
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $install = 'C:\actions-runner\GoMCP'
+          $state = Join-Path $install 'state'
+          $supervisor = Join-Path $install 'supervisor.js'
+          if (-not (Test-Path $supervisor)) { throw 'GoMCP is not installed yet' }
+
+          $healthy = $false
+          try {
+            $h = Invoke-RestMethod -UseBasicParsing -Uri 'http://127.0.0.1:8765/health' -TimeoutSec 3
+            $healthy = [bool]($h.ok -and $h.toolCount -eq 50)
+          } catch {}
+
+          if (-not $healthy) {
+            $pidFile = Join-Path $state 'supervisor.pid'
+            if (Test-Path $pidFile) {
+              try {
+                $oldPid = [int](Get-Content $pidFile -Raw).Trim()
+                if ($oldPid -gt 0) { taskkill.exe /PID $oldPid /T /F 2>$null | Out-Null }
+              } catch {}
+              Remove-Item -Force $pidFile -ErrorAction SilentlyContinue
+            }
+            $node = (Get-Command node.exe -ErrorAction Stop).Source
+            $env:RUNNER_TRACKING_ID = 'gomcp-daemon'
+            $p = Start-Process -FilePath $node -ArgumentList @($supervisor) -WorkingDirectory $install -WindowStyle Hidden -PassThru
+            Write-Host "gomcp_restarted_pid=$($p.Id)"
+          } else {
+            Write-Host 'gomcp_local=healthy'
+          }
+
+          $ok = $false
+          for ($i=0; $i -lt 45; $i++) {
+            try {
+              $h = Invoke-RestMethod -UseBasicParsing -Uri 'http://127.0.0.1:8765/health' -TimeoutSec 2
+              $r = Invoke-RestMethod -UseBasicParsing -Uri 'https://8.235.7.248/goproxy/health' -TimeoutSec 5
+              if ($h.ok -and $h.toolCount -eq 50 -and $r.ok -and $r.upstream_registered) { $ok = $true; break }
+            } catch {}
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ok) { throw 'GoMCP or relay is not healthy after watchdog recovery' }
+          Write-Host 'gomcp_watchdog=healthy relay_registered=yes'
