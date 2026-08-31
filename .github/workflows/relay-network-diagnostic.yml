@@ -1,0 +1,37 @@
+name: Diagnose GoProxy network hop
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/relay-network-diagnostic.yml']
+
+jobs:
+  diagnose:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Probe Docker to host relay
+        shell: bash
+        run: |
+          set -u
+          container=neon-wreckers-gateway-1
+          gateway_ip="$(sudo docker inspect "$container" --format '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}')"
+          echo "gateway_ip=$gateway_ip"
+          echo '=== service ==='
+          sudo systemctl --no-pager --full status goproxy.service | head -n 25 || true
+          echo '=== listener ==='
+          sudo ss -ltnp | grep ':8787' || true
+          echo '=== host local ==='
+          curl --max-time 3 -sv http://127.0.0.1:8787/health 2>&1 || true
+          echo '=== host bridge ==='
+          curl --max-time 3 -sv "http://${gateway_ip}:8787/health" 2>&1 || true
+          echo '=== from gateway container ==='
+          sudo docker exec "$container" sh -lc "wget -T 3 -S -O - http://${gateway_ip}:8787/health 2>&1" || true
+          echo '=== public route ==='
+          curl --max-time 5 -sv "https://8.235.7.248/goproxy/health" 2>&1 || true
+          echo '=== ufw ==='
+          sudo ufw status verbose 2>&1 || true
+          echo '=== firewall input summary ==='
+          sudo iptables -nvL INPUT --line-numbers 2>&1 | head -n 120 || true
+          echo '=== docker user chain ==='
+          sudo iptables -nvL DOCKER-USER --line-numbers 2>&1 | head -n 120 || true
