@@ -17,8 +17,9 @@ jobs:
     timeout-minutes: 5
     outputs:
       public_key: ${{ steps.key.outputs.public_key }}
+      owner_hash: ${{ steps.key.outputs.owner_hash }}
     steps:
-      - name: Create persistent relay wrapping key
+      - name: Create persistent wrapping key and owner authorization key
         id: key
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
@@ -26,6 +27,7 @@ jobs:
           $homeDir = 'C:\actions-runner\GoMCP'
           $stateDir = Join-Path $homeDir 'state'
           New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+
           $private = Join-Path $stateDir 'relay-private.pem'
           $public = Join-Path $stateDir 'relay-public.pem'
           if (-not (Test-Path $private) -or -not (Test-Path $public)) {
@@ -39,42 +41,86 @@ jobs:
             node -e $script $private $public
             if ($LASTEXITCODE -ne 0) { throw 'RSA wrapping-key generation failed' }
           }
+
+          $ownerKeyFile = Join-Path $stateDir 'mcp.token'
+          if (-not (Test-Path $ownerKeyFile) -or (Get-Item $ownerKeyFile).Length -lt 32) {
+            $tokenScript = "const fs=require('fs'),crypto=require('crypto');fs.writeFileSync(process.argv[1],crypto.randomBytes(48).toString('base64url')+'\\n',{mode:0o600});"
+            node -e $tokenScript $ownerKeyFile
+            if ($LASTEXITCODE -ne 0) { throw 'owner key generation failed' }
+          }
+          $ownerKey = (Get-Content $ownerKeyFile -Raw).Trim()
+          if ($ownerKey.Length -lt 32) { throw 'owner key is unexpectedly short' }
+          $sha = [Security.Cryptography.SHA256]::Create()
+          try {
+            $bytes = [Text.Encoding]::UTF8.GetBytes($ownerKey)
+            $ownerHash = -join ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') })
+          } finally { $sha.Dispose() }
+
           $pub64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($public))
           "public_key=$pub64" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding ascii -Append
-          Write-Host 'relay_wrapping_key=ready'
+          "owner_hash=$ownerHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding ascii -Append
+          Write-Host 'relay_wrapping_key=ready owner_key=present_not_printed'
 
-  wrap-relay-secret:
+  wrap-relay-bundle:
     needs: prepare-key
     runs-on: [self-hosted, linux, x64]
     timeout-minutes: 5
     outputs:
       ciphertext: ${{ steps.wrap.outputs.ciphertext }}
     steps:
-      - name: Encrypt relay registration credential for GoMCP
+      - name: Synchronize owner verifier and encrypt relay credentials for GoMCP
         id: wrap
         shell: bash
         env:
           PUBLIC_KEY_B64: ${{ needs.prepare-key.outputs.public_key }}
+          OWNER_HASH: ${{ needs.prepare-key.outputs.owner_hash }}
         run: |
           set -euo pipefail
-          secret_file=/home/crazytaxzi/GoProxy/state/register.secret
-          test -s "$secret_file"
+          state="$HOME/GoProxy/state"
+          mkdir -p "$state"
+          chmod 700 "$state"
+          [[ "$OWNER_HASH" =~ ^[0-9a-f]{64}$ ]]
+          printf '%s\n' "$OWNER_HASH" > "$state/owner-token.sha256"
+          chmod 600 "$state/owner-token.sha256"
+
+          for name in register upstream; do
+            file="$state/${name}.secret"
+            if [[ ! -s "$file" ]]; then
+              python3 - <<'PY' > "$file"
+          import secrets
+          print(secrets.token_urlsafe(48))
+          PY
+              chmod 600 "$file"
+            fi
+          done
+
           umask 077
           tmp="$(mktemp -d)"
           trap 'rm -rf "$tmp"' EXIT
           printf '%s' "$PUBLIC_KEY_B64" | base64 -d > "$tmp/public.pem"
           openssl pkey -pubin -in "$tmp/public.pem" -noout >/dev/null
+          python3 - "$state/register.secret" "$state/upstream.secret" "$tmp/payload.json" <<'PY'
+          import json, pathlib, sys
+          register_path, upstream_path, output = map(pathlib.Path, sys.argv[1:])
+          payload = {
+              'relay_secret': register_path.read_text(encoding='utf-8').strip(),
+              'upstream_secret': upstream_path.read_text(encoding='utf-8').strip(),
+          }
+          assert len(payload['relay_secret']) >= 32
+          assert len(payload['upstream_secret']) >= 32
+          output.write_text(json.dumps(payload, separators=(',', ':')), encoding='utf-8')
+          PY
           openssl pkeyutl -encrypt -pubin -inkey "$tmp/public.pem" \
             -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
-            -in "$secret_file" -out "$tmp/wrapped.bin"
+            -in "$tmp/payload.json" -out "$tmp/wrapped.bin"
           ciphertext="$(base64 -w0 "$tmp/wrapped.bin")"
           echo "ciphertext=$ciphertext" >> "$GITHUB_OUTPUT"
-          echo 'relay_secret_wrapped=yes'
+          echo 'relay_bundle_wrapped=yes owner_verifier_synchronized=yes'
 
   deploy:
-    needs: wrap-relay-secret
+    needs: wrap-relay-bundle
     runs-on: [self-hosted, GoMCP]
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
       - name: Check out GoMCP source
         uses: actions/checkout@v4
@@ -99,10 +145,10 @@ jobs:
           Remove-Item -Force (Join-Path $state 'tunnel.json') -ErrorAction SilentlyContinue
           Write-Host 'prior_gomcp=stopped_or_absent'
 
-      - name: Install GoMCP and cloudflared
+      - name: Install GoMCP, relay credentials and cloudflared
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
-          WRAPPED_RELAY_SECRET: ${{ needs.wrap-relay-secret.outputs.ciphertext }}
+          WRAPPED_RELAY_BUNDLE: ${{ needs.wrap-relay-bundle.outputs.ciphertext }}
         run: |
           $ErrorActionPreference = 'Stop'
           $install = 'C:\actions-runner\GoMCP'
@@ -112,11 +158,12 @@ jobs:
 
           Copy-Item -Force '.\mcp\gomcp.js' (Join-Path $install 'gomcp.js')
           Copy-Item -Force '.\mcp\supervisor.js' (Join-Path $install 'supervisor.js')
-
           node --check (Join-Path $install 'gomcp.js')
           if ($LASTEXITCODE -ne 0) { throw 'gomcp.js syntax check failed' }
           node --check (Join-Path $install 'supervisor.js')
           if ($LASTEXITCODE -ne 0) { throw 'supervisor.js syntax check failed' }
+          node --check '.\mcp\oauth-smoke.js'
+          if ($LASTEXITCODE -ne 0) { throw 'oauth-smoke.js syntax check failed' }
 
           $cloudflared = Join-Path $install 'cloudflared.exe'
           $download = Join-Path $install 'cloudflared.new.exe'
@@ -129,27 +176,25 @@ jobs:
 
           $private = Join-Path $state 'relay-private.pem'
           if (-not (Test-Path $private)) { throw 'persistent relay private key is missing' }
-          $wrappedFile = Join-Path $state 'relay-wrapped.bin'
-          [IO.File]::WriteAllBytes($wrappedFile, [Convert]::FromBase64String($env:WRAPPED_RELAY_SECRET))
-          $relaySecretFile = Join-Path $state 'relay.secret'
+          $wrappedFile = Join-Path $state 'relay-bundle.bin'
+          $payloadFile = Join-Path $state 'relay-bundle.json'
+          [IO.File]::WriteAllBytes($wrappedFile, [Convert]::FromBase64String($env:WRAPPED_RELAY_BUNDLE))
           $decrypt = @'
           const fs=require('fs'),crypto=require('crypto');
           const [priv,wrapped,out]=process.argv.slice(1);
-          const secret=crypto.privateDecrypt({key:fs.readFileSync(priv),padding:crypto.constants.RSA_PKCS1_OAEP_PADDING,oaepHash:'sha256'},fs.readFileSync(wrapped));
-          fs.writeFileSync(out,secret,{mode:0o600});
+          const clear=crypto.privateDecrypt({key:fs.readFileSync(priv),padding:crypto.constants.RSA_PKCS1_OAEP_PADDING,oaepHash:'sha256'},fs.readFileSync(wrapped));
+          fs.writeFileSync(out,clear,{mode:0o600});
           '@
-          node -e $decrypt $private $wrappedFile $relaySecretFile
-          if ($LASTEXITCODE -ne 0) { throw 'relay credential decrypt failed' }
+          node -e $decrypt $private $wrappedFile $payloadFile
+          if ($LASTEXITCODE -ne 0) { throw 'relay credential bundle decrypt failed' }
           Remove-Item -Force $wrappedFile
-          if ((Get-Item $relaySecretFile).Length -lt 20) { throw 'relay credential is unexpectedly short' }
-
-          $tokenFile = Join-Path $state 'mcp.token'
-          if (-not (Test-Path $tokenFile) -or (Get-Item $tokenFile).Length -lt 32) {
-            $tokenScript = "const fs=require('fs'),crypto=require('crypto');fs.writeFileSync(process.argv[1],crypto.randomBytes(48).toString('base64url')+'\\n',{mode:0o600});"
-            node -e $tokenScript $tokenFile
-            if ($LASTEXITCODE -ne 0) { throw 'MCP token generation failed' }
-          }
-          Write-Host 'mcp_auth_token=present_not_printed'
+          $bundle = Get-Content $payloadFile -Raw | ConvertFrom-Json
+          Remove-Item -Force $payloadFile
+          if ($bundle.relay_secret.Length -lt 32 -or $bundle.upstream_secret.Length -lt 32) { throw 'relay credential bundle is invalid' }
+          [IO.File]::WriteAllText((Join-Path $state 'relay.secret'), [string]$bundle.relay_secret, [Text.UTF8Encoding]::new($false))
+          [IO.File]::WriteAllText((Join-Path $state 'upstream.secret'), [string]$bundle.upstream_secret, [Text.UTF8Encoding]::new($false))
+          if (-not (Test-Path (Join-Path $state 'mcp.token'))) { throw 'owner key is missing' }
+          Write-Host 'relay_credentials=installed owner_key=present_not_printed'
 
       - name: Start detached GoMCP supervisor
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
@@ -161,13 +206,13 @@ jobs:
           $p = Start-Process -FilePath $node -ArgumentList @((Join-Path $install 'supervisor.js')) -WorkingDirectory $install -WindowStyle Hidden -PassThru
           Write-Host "supervisor_started_pid=$($p.Id)"
 
-      - name: Verify local server, tunnel, relay and authenticated MCP
+      - name: Verify server, current tunnel and internal authentication
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
           $install = 'C:\actions-runner\GoMCP'
           $state = Join-Path $install 'state'
-          $token = (Get-Content (Join-Path $state 'mcp.token') -Raw).Trim()
+          $upstream = (Get-Content (Join-Path $state 'upstream.secret') -Raw).Trim()
 
           $healthy = $false
           for ($i=0; $i -lt 60; $i++) {
@@ -178,11 +223,16 @@ jobs:
             Start-Sleep -Seconds 1
           }
           if (-not $healthy) { throw 'local GoMCP did not become healthy' }
-          Write-Host 'local_gomcp=healthy tools=50'
+
+          $payloadFile = Join-Path $env:RUNNER_TEMP 'gomcp-internal-ping.json'
+          [IO.File]::WriteAllText($payloadFile, '{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}', [Text.UTF8Encoding]::new($false))
+          $bodyFile = Join-Path $env:RUNNER_TEMP 'gomcp-internal-response.json'
+          $code = & curl.exe --max-time 10 --silent --show-error -o $bodyFile -w '%{http_code}' -H "Authorization: Bearer $upstream" -H 'Content-Type: application/json' --data-binary "@$payloadFile" 'http://127.0.0.1:8765/mcp'
+          if ($code -ne '200') { throw "local internal-auth MCP ping failed status=$code" }
 
           $tunnelFile = Join-Path $state 'tunnel.json'
           $tunnel = $null
-          for ($i=0; $i -lt 90; $i++) {
+          for ($i=0; $i -lt 120; $i++) {
             if (Test-Path $tunnelFile) {
               try {
                 $tunnel = Get-Content $tunnelFile -Raw | ConvertFrom-Json
@@ -191,45 +241,43 @@ jobs:
             }
             Start-Sleep -Seconds 1
           }
-          if (-not $tunnel -or -not $tunnel.url) { throw 'Quick Tunnel URL was not captured' }
-          Write-Host "quick_tunnel=$($tunnel.url)"
+          if (-not $tunnel -or -not $tunnel.url) { throw 'Quick Tunnel URL was not published after relay readiness' }
 
-          $relay = $null
-          for ($i=0; $i -lt 60; $i++) {
-            try {
-              $relay = Invoke-RestMethod -UseBasicParsing -Uri 'https://8.235.7.248/goproxy/health' -TimeoutSec 5
-              if ($relay.ok -and $relay.upstream_registered -and $relay.upstream_host -eq ([Uri]$tunnel.url).Host) { break }
-            } catch {}
-            Start-Sleep -Seconds 1
+          $relay = Invoke-RestMethod -UseBasicParsing -Uri 'https://8.235.7.248/goproxy/health' -TimeoutSec 10
+          if (-not $relay.ok -or -not $relay.oauth -or -not $relay.upstream_registered -or $relay.upstream_host -ne ([Uri]$tunnel.url).Host) {
+            throw 'stable relay is not synchronized to the current Quick Tunnel'
           }
-          if (-not $relay -or -not $relay.upstream_registered -or $relay.upstream_host -ne ([Uri]$tunnel.url).Host) { throw 'relay did not register current GoMCP tunnel' }
-          Write-Host 'relay_upstream_registered=yes'
+          Write-Host "gomcp_local=healthy tools=50 quick_tunnel=$($tunnel.url) relay_current=yes"
 
-          $payloadFile = Join-Path $env:RUNNER_TEMP 'gomcp-deploy-ping.json'
-          [IO.File]::WriteAllText($payloadFile, '{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}', [Text.UTF8Encoding]::new($false))
-          $bodyFile = Join-Path $env:RUNNER_TEMP 'gomcp-deploy-response.json'
-          $code = & curl.exe --max-time 20 --silent --show-error -o $bodyFile -w '%{http_code}' -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data-binary "@$payloadFile" 'https://8.235.7.248/goproxy/mcp'
-          if ($code -ne '200') { throw "public authenticated MCP ping failed status=$code" }
-          $rpc = Get-Content $bodyFile -Raw | ConvertFrom-Json
-          if ($rpc.jsonrpc -ne '2.0' -or $rpc.id -ne 1 -or $null -eq $rpc.result) { throw 'unexpected MCP ping response' }
-          Write-Host 'public_mcp_ping=success'
-          Write-Host 'mcp_endpoint=https://8.235.7.248/goproxy/mcp'
-          Write-Host "token_file=$state\mcp.token"
+      - name: Verify full ChatGPT OAuth flow, tools and refresh token
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
+        env:
+          GOMCP_OWNER_KEY_FILE: C:\actions-runner\GoMCP\state\mcp.token
+          GOMCP_PUBLIC_ORIGIN: https://8.235.7.248
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node '.\mcp\oauth-smoke.js'
+          if ($LASTEXITCODE -ne 0) { throw 'OAuth end-to-end smoke test failed' }
 
   external-probe:
     needs: deploy
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Prove stable relay reaches authenticated GoMCP from outside GAMEPC
+      - name: Prove OAuth discovery and protection from outside GAMEPC
         shell: bash
         run: |
           set -euo pipefail
+          base='https://8.235.7.248'
+          prm="$(curl --max-time 20 -fsS "$base/.well-known/oauth-protected-resource/goproxy/mcp")"
+          meta="$(curl --max-time 20 -fsS "$base/.well-known/oauth-authorization-server/goproxy/oauth")"
+          printf '%s' "$prm" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['resource']=='https://8.235.7.248/goproxy/mcp'; assert d['authorization_servers']==['https://8.235.7.248/goproxy/oauth']"
+          printf '%s' "$meta" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['registration_endpoint']=='https://8.235.7.248/goproxy/oauth/register'; assert 'refresh_token' in d['grant_types_supported']; assert 'offline_access' in d['scopes_supported']; assert d['token_endpoint_auth_methods_supported']==['none']"
+
           body='{"jsonrpc":"2.0","id":99,"method":"ping","params":{}}'
-          code="$(curl --max-time 20 -sS -o /tmp/gomcp-response -w '%{http_code}' -H 'Content-Type: application/json' --data "$body" 'https://8.235.7.248/goproxy/mcp')"
-          cat /tmp/gomcp-response
-          echo
-          echo "status=$code"
+          code="$(curl --max-time 20 -sS -D /tmp/gomcp-headers -o /tmp/gomcp-response -w '%{http_code}' -H 'Content-Type: application/json' --data "$body" "$base/goproxy/mcp")"
           test "$code" = '401'
+          grep -qi 'www-authenticate:.*Bearer' /tmp/gomcp-headers
+          grep -qi 'resource_metadata=.*oauth-protected-resource' /tmp/gomcp-headers
           grep -q 'unauthorized' /tmp/gomcp-response
-          echo 'external_end_to_end=success_auth_enforced=yes'
+          echo 'external_oauth_discovery=success mcp_protected=yes'
