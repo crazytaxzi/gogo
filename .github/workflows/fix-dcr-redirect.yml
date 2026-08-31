@@ -20,30 +20,9 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
+          import re, textwrap
           p = Path('relay/oauth.py')
           s = p.read_text(encoding='utf-8')
-          old = '''    @staticmethod
-              def _validate_redirect_uri(uri: str) -> str:
-                  parsed = urlsplit(uri)
-                  if (
-                      parsed.scheme != "https"
-                      or parsed.hostname is None
-                      or parsed.hostname.lower() != "chatgpt.com"
-                      or parsed.username
-                      or parsed.password
-                      or parsed.fragment
-                      or parsed.query
-                      or not parsed.path.startswith("/connector/oauth/")
-                  ):
-                      raise OAuthError(
-                          "invalid_redirect_uri",
-                          "GoMCP dynamic clients must use an HTTPS chatgpt.com /connector/oauth/ callback",
-                      )
-                  return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
-          '''
-          # Dedent the literal indentation introduced by this workflow's YAML block.
-          import textwrap
-          old = textwrap.dedent(old)
           new = textwrap.dedent('''
               @staticmethod
               def _validate_redirect_uri(uri: str) -> str:
@@ -67,13 +46,14 @@ jobs:
                           "invalid_redirect_uri",
                           "GoMCP dynamic clients must use an HTTPS ChatGPT-owned /connector/oauth/ callback",
                       )
-                  # Preserve ChatGPT's callback exactly, including any query component.
                   return urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, ""))
+
           ''').lstrip('\n')
-          if old not in s:
-              raise SystemExit('expected redirect validator block not found')
-          s = s.replace(old, new, 1)
-          p.write_text(s, encoding='utf-8')
+          pattern = r'    @staticmethod\n    def _validate_redirect_uri\(uri: str\) -> str:\n.*?(?=    def register_client\()'
+          s2, n = re.subn(pattern, new, s, count=1, flags=re.S)
+          if n != 1:
+              raise SystemExit(f'redirect validator replacement count={n}')
+          p.write_text(s2, encoding='utf-8')
           PY
           python3 -m py_compile relay/oauth.py relay/goproxy.py
           python3 - <<'PY'
