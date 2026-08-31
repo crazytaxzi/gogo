@@ -243,7 +243,7 @@ jobs:
           }
           if (-not $tunnel -or -not $tunnel.url) { throw 'Quick Tunnel URL was not published after relay readiness' }
 
-          $relay = Invoke-RestMethod -UseBasicParsing -Uri 'https://8.235.7.248/goproxy/health' -TimeoutSec 10
+          $relay = Invoke-RestMethod -UseBasicParsing -Uri 'https://gomcp-8-235-7-248.nip.io/goproxy/health' -TimeoutSec 10
           if (-not $relay.ok -or -not $relay.oauth -or -not $relay.upstream_registered -or $relay.upstream_host -ne ([Uri]$tunnel.url).Host) {
             throw 'stable relay is not synchronized to the current Quick Tunnel'
           }
@@ -253,7 +253,7 @@ jobs:
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         env:
           GOMCP_OWNER_KEY_FILE: C:\actions-runner\GoMCP\state\mcp.token
-          GOMCP_PUBLIC_ORIGIN: https://8.235.7.248
+          GOMCP_PUBLIC_ORIGIN: https://gomcp-8-235-7-248.nip.io
         run: |
           $ErrorActionPreference = 'Stop'
           node '.\mcp\oauth-smoke.js'
@@ -268,16 +268,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base='https://8.235.7.248'
+          base='https://gomcp-8-235-7-248.nip.io'
           prm="$(curl --max-time 20 -fsS "$base/.well-known/oauth-protected-resource/goproxy/mcp")"
           meta="$(curl --max-time 20 -fsS "$base/.well-known/oauth-authorization-server/goproxy/oauth")"
-          printf '%s' "$prm" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['resource']=='https://8.235.7.248/goproxy/mcp'; assert d['authorization_servers']==['https://8.235.7.248/goproxy/oauth']"
-          printf '%s' "$meta" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['registration_endpoint']=='https://8.235.7.248/goproxy/oauth/register'; assert 'refresh_token' in d['grant_types_supported']; assert 'offline_access' in d['scopes_supported']; assert d['token_endpoint_auth_methods_supported']==['none']"
+          printf '%s' "$prm" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['resource']=='https://gomcp-8-235-7-248.nip.io/goproxy/mcp'; assert d['authorization_servers']==['https://gomcp-8-235-7-248.nip.io/goproxy/oauth']"
+          printf '%s' "$meta" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['registration_endpoint']=='https://gomcp-8-235-7-248.nip.io/goproxy/oauth/register'; assert 'refresh_token' in d['grant_types_supported']; assert 'offline_access' in d['scopes_supported']; assert d['token_endpoint_auth_methods_supported']==['none']"
 
           body='{"jsonrpc":"2.0","id":99,"method":"ping","params":{}}'
           code="$(curl --max-time 20 -sS -D /tmp/gomcp-headers -o /tmp/gomcp-response -w '%{http_code}' -H 'Content-Type: application/json' --data "$body" "$base/goproxy/mcp")"
           test "$code" = '401'
           grep -qi 'www-authenticate:.*Bearer' /tmp/gomcp-headers
           grep -qi 'resource_metadata=.*oauth-protected-resource' /tmp/gomcp-headers
-          grep -q 'unauthorized' /tmp/gomcp-response
-          echo 'external_oauth_discovery=success mcp_protected=yes'
+          grep -q 'authorization_required\|invalid_token' /tmp/gomcp-response
+          echo 'external_hostname_tls_oauth=success mcp_protected=yes'
