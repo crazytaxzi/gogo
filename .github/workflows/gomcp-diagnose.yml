@@ -1,0 +1,36 @@
+name: Diagnose GoMCP relay hop
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/gomcp-diagnose.yml']
+
+jobs:
+  relay-side:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Probe registered Quick Tunnel from relay host
+        shell: bash
+        run: |
+          set -u
+          target="$(python3 -c "import json; print(json.load(open('/home/crazytaxzi/GoProxy/state/relay.json'))['target'])")"
+          echo "target=$target"
+          echo '--- direct health ---'
+          curl --max-time 15 -sv "$target/health" 2>&1 || true
+          echo '--- direct unauth MCP ---'
+          curl --max-time 15 -sv -H 'Content-Type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}' "$target/mcp" 2>&1 || true
+          echo '--- stable unauth MCP ---'
+          curl --max-time 15 -sv -H 'Content-Type: application/json' --data '{"jsonrpc":"2.0","id":2,"method":"ping","params":{}}' 'https://8.235.7.248/goproxy/mcp' 2>&1 || true
+          echo '--- goproxy logs ---'
+          sudo journalctl -u goproxy.service -n 80 --no-pager || true
+
+  external:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe stable relay from GitHub-hosted runner
+        shell: bash
+        run: |
+          set -u
+          curl --max-time 20 -sv -H 'Content-Type: application/json' --data '{"jsonrpc":"2.0","id":3,"method":"ping","params":{}}' 'https://8.235.7.248/goproxy/mcp' 2>&1 || true
