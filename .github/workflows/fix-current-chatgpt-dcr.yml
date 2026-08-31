@@ -1,0 +1,141 @@
+name: Fix current ChatGPT DCR redirect contract
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fix-current-chatgpt-dcr.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update redirect validation to current OpenAI contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('relay/oauth.py')
+          lines = p.read_text(encoding='utf-8').splitlines(True)
+          fn = next(i for i,l in enumerate(lines) if l.startswith('    def _validate_redirect_uri('))
+          start = fn - 1 if lines[fn-1].strip() == '@staticmethod' else fn
+          end = next(i for i,l in enumerate(lines[fn+1:], fn+1) if l.startswith('    def register_client('))
+
+          replacement = [
+              '    @staticmethod\n',
+              '    def _validate_redirect_uri(uri: str) -> str:\n',
+              '        parsed = urlsplit(uri)\n',
+              '        host = (parsed.hostname or "").lower().rstrip(".")\n',
+              '        try:\n',
+              '            port = parsed.port\n',
+              '        except ValueError:\n',
+              '            port = -1\n',
+              '        callback_id_prefix = "/connector/oauth/"\n',
+              '        valid_path = (\n',
+              '            parsed.path == "/connector_platform_oauth_redirect"\n',
+              '            or (\n',
+              '                parsed.path.startswith(callback_id_prefix)\n',
+              '                and len(parsed.path) > len(callback_id_prefix)\n',
+              '                and "/" not in parsed.path[len(callback_id_prefix):]\n',
+              '            )\n',
+              '        )\n',
+              '        if (\n',
+              '            parsed.scheme.lower() != "https"\n',
+              '            or host != "chatgpt.com"\n',
+              '            or port not in (None, 443)\n',
+              '            or parsed.username\n',
+              '            or parsed.password\n',
+              '            or parsed.query\n',
+              '            or parsed.fragment\n',
+              '            or not valid_path\n',
+              '        ):\n',
+              '            raise OAuthError(\n',
+              '                "invalid_redirect_uri",\n',
+              '                "GoMCP accepts current ChatGPT OAuth callbacks only",\n',
+              '            )\n',
+              '        return urlunsplit(("https", parsed.netloc, parsed.path, "", ""))\n',
+              '\n',
+          ]
+          lines[start:end] = replacement
+          p.write_text(''.join(lines), encoding='utf-8')
+          PY
+
+          python3 -m py_compile relay/oauth.py relay/goproxy.py
+
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('gomcp_oauth', Path('relay/oauth.py'))
+          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+          good = [
+              'https://chatgpt.com/connector_platform_oauth_redirect',
+              'https://chatgpt.com/connector/oauth/abc123XYZ_-',
+          ]
+          bad = [
+              'https://auth.chatgpt.com/connector_platform_oauth_redirect',
+              'https://chatgpt.com/connector_platform_oauth_redirect/',
+              'https://chatgpt.com/connector_platform_oauth_redirect?x=1',
+              'https://chatgpt.com/connector/oauth/',
+              'https://chatgpt.com/connector/oauth/a/b',
+              'https://evil.example/connector_platform_oauth_redirect',
+              'http://chatgpt.com/connector_platform_oauth_redirect',
+          ]
+          for uri in good:
+              assert m.OAuthManager._validate_redirect_uri(uri) == uri
+          for uri in bad:
+              try:
+                  m.OAuthManager._validate_redirect_uri(uri)
+              except m.OAuthError:
+                  pass
+              else:
+                  raise AssertionError(f'unsafe or undocumented redirect accepted: {uri}')
+          print('current_openai_redirect_contract=success')
+          PY
+
+          git config user.name 'GoMCP Automation'
+          git config user.email 'actions@users.noreply.github.com'
+          git add relay/oauth.py
+          git commit -m 'Support current ChatGPT stable OAuth callback'
+          git push origin HEAD:main
+
+      - name: Install corrected OAuth handler live
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 0644 relay/oauth.py "$HOME/GoProxy/oauth.py"
+          sudo systemctl restart goproxy.service
+          sudo systemctl is-active --quiet goproxy.service
+          sleep 1
+
+      - name: Prove live DCR for both documented callback forms
+        shell: bash
+        run: |
+          set -euo pipefail
+          endpoint='https://gomcp-8-235-7-248.nip.io/goproxy/oauth/register'
+          for redirect in \
+            'https://chatgpt.com/connector_platform_oauth_redirect' \
+            'https://chatgpt.com/connector/oauth/current-test-id'
+          do
+            body="$(python3 -c 'import json,sys; print(json.dumps({"client_name":"ChatGPT","redirect_uris":[sys.argv[1]],"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"],"response_types":["code"],"application_type":"web"}))' "$redirect")"
+            code="$(curl --max-time 10 -sS -o /tmp/dcr-current.json -w '%{http_code}' -H 'Content-Type: application/json' --data "$body" "$endpoint")"
+            cat /tmp/dcr-current.json
+            echo
+            test "$code" = '201'
+            python3 - "$redirect" <<'PY'
+          import json, sys
+          expected=sys.argv[1]
+          d=json.load(open('/tmp/dcr-current.json'))
+          assert d['redirect_uris'] == [expected]
+          assert d['client_id']
+          assert d['token_endpoint_auth_method'] == 'none'
+          PY
+          done
+          echo 'live_current_chatgpt_dcr=success'
