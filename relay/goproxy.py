@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GoProxy: tiny authenticated reverse proxy for a rotating Cloudflare Quick Tunnel."""
+"""GoProxy: stable OAuth front door for a rotating Cloudflare Quick Tunnel."""
 
 from __future__ import annotations
 
@@ -16,7 +16,9 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
+
+from oauth import OAuthError, OAuthManager
 
 LOG = logging.getLogger("goproxy")
 HOP_HEADERS = {
@@ -95,23 +97,60 @@ class RelayState:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "GoProxy/0.3"
+    server_version = "GoProxy/1.0"
 
     @property
     def state(self) -> RelayState:
         return self.server.relay_state  # type: ignore[attr-defined]
 
+    @property
+    def oauth(self) -> OAuthManager:
+        return self.server.oauth  # type: ignore[attr-defined]
+
+    @property
+    def upstream_secret_file(self) -> Path:
+        return self.server.upstream_secret_file  # type: ignore[attr-defined]
+
     def log_message(self, fmt: str, *args) -> None:
         LOG.info("%s %s", self.client_address[0], fmt % args)
 
-    def _json(self, status: int, payload: dict) -> None:
+    def _json(self, status: int, payload: dict, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if headers:
+            for key, value in headers.items():
+                self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def _html(self, status: int, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _read_body(self, max_bytes: int) -> bytes:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if length <= 0 or length > max_bytes:
+            raise ValueError("invalid body length")
+        return self.rfile.read(length)
 
     def _bearer(self) -> str:
         value = self.headers.get("Authorization", "")
@@ -130,7 +169,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             conn.request("GET", health_path, headers={
                 "Host": parsed.netloc,
-                "User-Agent": "GoProxy/0.3 readiness",
+                "User-Agent": "GoProxy/1.0 readiness",
                 "Accept": "application/json",
             })
             resp = conn.getresponse()
@@ -155,10 +194,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(401, {"ok": False, "error": "unauthorized"})
             return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length < 2 or length > 8192:
-                raise ValueError("invalid body length")
-            data = json.loads(self.rfile.read(length))
+            data = json.loads(self._read_body(8192))
             target = str(data.get("target", "")).strip()
             self.state._validate_target(target)
             parsed = urlsplit(target)
@@ -188,16 +224,102 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {
             "ok": True,
             "service": "goproxy",
+            "oauth": True,
+            "oauth_owner_ready": self.oauth.owner_hash_file.is_file(),
+            "upstream_secret_ready": self.upstream_secret_file.is_file(),
             "upstream_registered": bool(target),
             "upstream_host": parsed.hostname if parsed else None,
             "updated_at": updated or None,
         })
+
+    def _oauth_error_json(self, exc: OAuthError) -> None:
+        self._json(exc.status, {"error": exc.error, "error_description": exc.description})
+
+    def _oauth_register(self) -> None:
+        try:
+            metadata = json.loads(self._read_body(64 * 1024))
+            if not isinstance(metadata, dict):
+                raise OAuthError("invalid_client_metadata", "Registration body must be a JSON object")
+            result = self.oauth.register_client(metadata)
+            self._json(201, result)
+        except OAuthError as exc:
+            self._oauth_error_json(exc)
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._json(400, {"error": "invalid_client_metadata", "error_description": str(exc)})
+
+    def _oauth_authorize_get(self) -> None:
+        try:
+            query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            request_id = self.oauth.begin_authorization(query)
+            self._html(200, self.oauth.authorization_form(request_id))
+        except OAuthError as exc:
+            self._html(exc.status, f"<!doctype html><title>GoMCP OAuth error</title><h1>Authorization error</h1><p>{exc.description}</p>")
+
+    def _oauth_authorize_post(self) -> None:
+        request_id = ""
+        try:
+            form = self.oauth.parse_form(self._read_body(64 * 1024))
+            request_values = form.get("request_id", [])
+            key_values = form.get("access_key", [])
+            if len(request_values) != 1 or len(key_values) != 1:
+                raise OAuthError("invalid_request", "Missing authorization form fields")
+            request_id = request_values[0]
+            location = self.oauth.finish_authorization(
+                request_id,
+                key_values[0],
+                self.client_address[0],
+            )
+            self._redirect(location)
+        except OAuthError as exc:
+            if request_id and exc.status in {401, 429}:
+                try:
+                    self._html(exc.status, self.oauth.authorization_form(request_id, exc.description))
+                    return
+                except OAuthError:
+                    pass
+            self._html(exc.status, f"<!doctype html><title>GoMCP OAuth error</title><h1>Authorization error</h1><p>{exc.description}</p>")
+        except ValueError as exc:
+            self._html(400, f"<!doctype html><title>GoMCP OAuth error</title><h1>Authorization error</h1><p>{exc}</p>")
+
+    def _oauth_token(self) -> None:
+        try:
+            content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if content_type != "application/x-www-form-urlencoded":
+                raise OAuthError("invalid_request", "Token requests must use application/x-www-form-urlencoded")
+            form = self.oauth.parse_form(self._read_body(64 * 1024))
+            result = self.oauth.exchange_token(form)
+            self._json(200, result, {"Pragma": "no-cache"})
+        except OAuthError as exc:
+            self._oauth_error_json(exc)
+        except ValueError as exc:
+            self._json(400, {"error": "invalid_request", "error_description": str(exc)})
+
+    def _upstream_secret(self) -> str:
+        try:
+            value = self.upstream_secret_file.read_text(encoding="utf-8").strip()
+        except FileNotFoundError as exc:
+            raise RuntimeError("upstream authentication is not configured") from exc
+        if len(value) < 32:
+            raise RuntimeError("upstream authentication secret is invalid")
+        return value
 
     def _proxy(self) -> None:
         target, _ = self.state.snapshot()
         if not target:
             self._json(503, {"ok": False, "error": "upstream_not_registered"})
             return
+
+        request_path = urlsplit(self.path).path
+        is_mcp = request_path == "/mcp"
+        if is_mcp:
+            supplied = self._bearer()
+            if not self.oauth.validate_access_token(supplied):
+                self._json(
+                    401,
+                    {"ok": False, "error": "unauthorized"},
+                    {"WWW-Authenticate": self.oauth.bearer_challenge(invalid_token=bool(supplied))},
+                )
+                return
 
         base = urlsplit(target)
         incoming_path = self.path if self.path.startswith("/") else "/" + self.path
@@ -207,7 +329,11 @@ class Handler(BaseHTTPRequestHandler):
         length_header = self.headers.get("Content-Length")
         body = None
         if length_header:
-            length = int(length_header)
+            try:
+                length = int(length_header)
+            except ValueError:
+                self._json(400, {"ok": False, "error": "invalid_content_length"})
+                return
             if length > 64 * 1024 * 1024:
                 self._json(413, {"ok": False, "error": "request_too_large"})
                 return
@@ -215,10 +341,19 @@ class Handler(BaseHTTPRequestHandler):
 
         headers: dict[str, str] = {}
         for key, value in self.headers.items():
-            if key.lower() not in HOP_HEADERS and key.lower() != "host":
-                headers[key] = value
+            lower = key.lower()
+            if lower in HOP_HEADERS or lower == "host" or (is_mcp and lower == "authorization"):
+                continue
+            headers[key] = value
         headers["Host"] = base.netloc
         headers["X-GoProxy-Forwarded-For"] = self.client_address[0]
+        if is_mcp:
+            try:
+                headers["Authorization"] = f"Bearer {self._upstream_secret()}"
+            except RuntimeError as exc:
+                LOG.error("Cannot proxy authenticated MCP request: %s", exc)
+                self._json(503, {"ok": False, "error": "upstream_auth_not_ready"})
+                return
 
         conn = http.client.HTTPSConnection(
             base.hostname,
@@ -233,7 +368,7 @@ class Handler(BaseHTTPRequestHandler):
             has_length = False
             for key, value in resp.getheaders():
                 lower = key.lower()
-                if lower in HOP_HEADERS:
+                if lower in HOP_HEADERS or (is_mcp and lower == "www-authenticate"):
                     continue
                 if lower == "content-length":
                     has_length = True
@@ -260,8 +395,21 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
 
     def do_GET(self) -> None:
-        if self.path == "/health":
+        path = urlsplit(self.path).path
+        if path == "/health":
             self._health()
+        elif path in {
+            "/.well-known/oauth-protected-resource/goproxy/mcp",
+            "/.well-known/oauth-protected-resource",
+        }:
+            self._json(200, self.oauth.protected_resource_metadata())
+        elif path in {
+            "/.well-known/oauth-authorization-server/goproxy/oauth",
+            "/oauth/.well-known/oauth-authorization-server",
+        }:
+            self._json(200, self.oauth.authorization_server_metadata())
+        elif path == "/oauth/authorize":
+            self._oauth_authorize_get()
         else:
             self._proxy()
 
@@ -269,8 +417,15 @@ class Handler(BaseHTTPRequestHandler):
         self._proxy()
 
     def do_POST(self) -> None:
-        if self.path == "/admin/register":
+        path = urlsplit(self.path).path
+        if path == "/admin/register":
             self._register()
+        elif path == "/oauth/register":
+            self._oauth_register()
+        elif path == "/oauth/authorize":
+            self._oauth_authorize_post()
+        elif path == "/oauth/token":
+            self._oauth_token()
         else:
             self._proxy()
 
@@ -291,9 +446,18 @@ class RelayHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, handler, relay_state: RelayState):
+    def __init__(
+        self,
+        address,
+        handler,
+        relay_state: RelayState,
+        oauth: OAuthManager,
+        upstream_secret_file: Path,
+    ):
         super().__init__(address, handler)
         self.relay_state = relay_state
+        self.oauth = oauth
+        self.upstream_secret_file = upstream_secret_file
 
 
 def main() -> int:
@@ -301,14 +465,25 @@ def main() -> int:
     parser.add_argument("--listen", default=os.getenv("GOPROXY_LISTEN", "127.0.0.1:8787"))
     parser.add_argument("--state", default=os.getenv("GOPROXY_STATE", "/home/crazytaxzi/GoProxy/state/relay.json"))
     parser.add_argument("--secret-file", default=os.getenv("GOPROXY_SECRET_FILE", "/home/crazytaxzi/GoProxy/state/register.secret"))
+    parser.add_argument("--upstream-secret-file", default=os.getenv("GOPROXY_UPSTREAM_SECRET_FILE", "/home/crazytaxzi/GoProxy/state/upstream.secret"))
+    parser.add_argument("--oauth-state", default=os.getenv("GOPROXY_OAUTH_STATE", "/home/crazytaxzi/GoProxy/state/oauth.json"))
+    parser.add_argument("--owner-hash-file", default=os.getenv("GOPROXY_OWNER_HASH_FILE", "/home/crazytaxzi/GoProxy/state/owner-token.sha256"))
+    parser.add_argument("--public-origin", default=os.getenv("GOPROXY_PUBLIC_ORIGIN", "https://8.235.7.248"))
     parser.add_argument("--allowed-suffix", default=os.getenv("GOPROXY_ALLOWED_SUFFIX", ".trycloudflare.com"))
     args = parser.parse_args()
 
     host, port_text = args.listen.rsplit(":", 1)
     state = RelayState(Path(args.state), Path(args.secret_file), args.allowed_suffix)
+    oauth = OAuthManager(Path(args.oauth_state), Path(args.owner_hash_file), args.public_origin)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    server = RelayHTTPServer((host, int(port_text)), Handler, state)
-    LOG.info("GoProxy listening on %s:%s", host, port_text)
+    server = RelayHTTPServer(
+        (host, int(port_text)),
+        Handler,
+        state,
+        oauth,
+        Path(args.upstream_secret_file),
+    )
+    LOG.info("GoProxy OAuth relay listening on %s:%s issuer=%s", host, port_text, oauth.issuer)
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
