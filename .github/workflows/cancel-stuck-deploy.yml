@@ -1,0 +1,20 @@
+name: Cancel superseded GoProxy deploy
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/cancel-stuck-deploy.yml']
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cancel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel superseded build-heavy deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh api --method POST "repos/$REPO/actions/runs/33356251699/cancel" || true
