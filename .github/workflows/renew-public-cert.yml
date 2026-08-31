@@ -28,7 +28,14 @@ jobs:
           restart_gateway() { sudo docker compose up -d gateway >/dev/null 2>&1 || true; }
           trap restart_gateway EXIT
 
-          sudo certbot certonly --standalone --non-interactive --agree-tos --force-renewal -d "$public_host"
+          sudo certbot certonly \
+            --standalone \
+            --non-interactive \
+            --agree-tos \
+            --force-renewal \
+            --preferred-profile shortlived \
+            --cert-name "$public_host" \
+            --ip-address "$public_host"
 
           restart_gateway
           trap - EXIT
