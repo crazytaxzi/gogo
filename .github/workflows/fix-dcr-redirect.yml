@@ -1,0 +1,136 @@
+name: Fix ChatGPT DCR redirect validation
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/fix-dcr-redirect.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Relax only ChatGPT-owned OAuth callback validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('relay/oauth.py')
+          s = p.read_text(encoding='utf-8')
+          old = '''    @staticmethod
+              def _validate_redirect_uri(uri: str) -> str:
+                  parsed = urlsplit(uri)
+                  if (
+                      parsed.scheme != "https"
+                      or parsed.hostname is None
+                      or parsed.hostname.lower() != "chatgpt.com"
+                      or parsed.username
+                      or parsed.password
+                      or parsed.fragment
+                      or parsed.query
+                      or not parsed.path.startswith("/connector/oauth/")
+                  ):
+                      raise OAuthError(
+                          "invalid_redirect_uri",
+                          "GoMCP dynamic clients must use an HTTPS chatgpt.com /connector/oauth/ callback",
+                      )
+                  return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+          '''
+          # Dedent the literal indentation introduced by this workflow's YAML block.
+          import textwrap
+          old = textwrap.dedent(old)
+          new = textwrap.dedent('''
+              @staticmethod
+              def _validate_redirect_uri(uri: str) -> str:
+                  parsed = urlsplit(uri)
+                  host = (parsed.hostname or "").lower().rstrip(".")
+                  chatgpt_owned = host == "chatgpt.com" or host.endswith(".chatgpt.com")
+                  try:
+                      port = parsed.port
+                  except ValueError:
+                      port = -1
+                  if (
+                      parsed.scheme.lower() != "https"
+                      or not chatgpt_owned
+                      or port not in (None, 443)
+                      or parsed.username
+                      or parsed.password
+                      or parsed.fragment
+                      or not parsed.path.startswith("/connector/oauth/")
+                  ):
+                      raise OAuthError(
+                          "invalid_redirect_uri",
+                          "GoMCP dynamic clients must use an HTTPS ChatGPT-owned /connector/oauth/ callback",
+                      )
+                  # Preserve ChatGPT's callback exactly, including any query component.
+                  return urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, ""))
+          ''').lstrip('\n')
+          if old not in s:
+              raise SystemExit('expected redirect validator block not found')
+          s = s.replace(old, new, 1)
+          p.write_text(s, encoding='utf-8')
+          PY
+          python3 -m py_compile relay/oauth.py relay/goproxy.py
+          python3 - <<'PY'
+          import importlib.util
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('gomcp_oauth', Path('relay/oauth.py'))
+          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          good = [
+              'https://chatgpt.com/connector/oauth/test-id',
+              'https://chatgpt.com/connector/oauth/test-id?surface=plugin',
+              'https://auth.chatgpt.com/connector/oauth/test-id?x=1',
+          ]
+          bad = [
+              'http://chatgpt.com/connector/oauth/test-id',
+              'https://evil.example/connector/oauth/test-id',
+              'https://chatgpt.com.evil.example/connector/oauth/test-id',
+              'https://chatgpt.com/not-oauth/test-id',
+          ]
+          for uri in good:
+              assert m.OAuthManager._validate_redirect_uri(uri) == uri
+          for uri in bad:
+              try: m.OAuthManager._validate_redirect_uri(uri)
+              except m.OAuthError: pass
+              else: raise AssertionError(f'unsafe redirect accepted: {uri}')
+          print('redirect_validation_tests=success')
+          PY
+
+          git config user.name 'GoMCP Automation'
+          git config user.email 'actions@users.noreply.github.com'
+          git add relay/oauth.py
+          git commit -m 'Accept ChatGPT DCR callback variants'
+          git push origin HEAD:main
+
+      - name: Install fixed OAuth handler live
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 0644 relay/oauth.py "$HOME/GoProxy/oauth.py"
+          sudo systemctl restart goproxy.service
+          sudo systemctl is-active --quiet goproxy.service
+          sleep 1
+          curl --max-time 10 -fsS https://gomcp-8-235-7-248.nip.io/.well-known/oauth-authorization-server/goproxy/oauth >/dev/null
+
+      - name: Prove DCR accepts ChatGPT callback variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          body='{"client_name":"ChatGPT DCR compatibility test","redirect_uris":["https://chatgpt.com/connector/oauth/test-callback?surface=plugin"],"token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"],"response_types":["code"],"application_type":"web"}'
+          code="$(curl --max-time 10 -sS -o /tmp/dcr.json -w '%{http_code}' -H 'Content-Type: application/json' --data "$body" https://gomcp-8-235-7-248.nip.io/goproxy/oauth/register)"
+          cat /tmp/dcr.json
+          echo
+          test "$code" = 201
+          python3 - <<'PY'
+          import json
+          d=json.load(open('/tmp/dcr.json'))
+          assert d['redirect_uris']==['https://chatgpt.com/connector/oauth/test-callback?surface=plugin']
+          assert d['token_endpoint_auth_method']=='none'
+          assert d['client_id']
+          print('live_dcr=success')
+          PY
