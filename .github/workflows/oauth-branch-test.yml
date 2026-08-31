@@ -1,0 +1,80 @@
+name: Validate GoMCP OAuth branch
+
+on:
+  push:
+    branches: [oauth-chatgpt]
+    paths:
+      - 'relay/**'
+      - 'mcp/**'
+      - '.github/workflows/oauth-branch-test.yml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax checks
+        run: |
+          set -euo pipefail
+          python3 -m py_compile relay/goproxy.py relay/oauth.py relay/gateway_patch.py
+          node --check mcp/gomcp.js
+          node --check mcp/supervisor.js
+          node --check mcp/oauth-smoke.js
+      - name: Exercise DCR PKCE authorization code and refresh flow
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, hashlib, json, secrets, tempfile, time
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, 'relay')
+          from oauth import OAuthManager
+          with tempfile.TemporaryDirectory() as td:
+              root = Path(td)
+              owner = secrets.token_urlsafe(48)
+              (root/'owner.sha256').write_text(hashlib.sha256(owner.encode()).hexdigest()+'\n')
+              oauth = OAuthManager(root/'oauth.json', root/'owner.sha256')
+              client = oauth.register_client({
+                  'client_name':'branch test',
+                  'redirect_uris':['https://chatgpt.com/connector/oauth/branch-test'],
+                  'token_endpoint_auth_method':'none',
+                  'grant_types':['authorization_code','refresh_token'],
+                  'response_types':['code'],
+              })
+              verifier = secrets.token_urlsafe(48)
+              challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode('ascii')).digest()).rstrip(b'=').decode()
+              request_id = oauth.begin_authorization({
+                  'response_type':['code'],
+                  'client_id':[client['client_id']],
+                  'redirect_uri':['https://chatgpt.com/connector/oauth/branch-test'],
+                  'code_challenge':[challenge],
+                  'code_challenge_method':['S256'],
+                  'state':['state123'],
+                  'scope':['gomcp offline_access'],
+                  'resource':[oauth.resource],
+              })
+              location = oauth.finish_authorization(request_id, owner, '127.0.0.1')
+              from urllib.parse import urlsplit, parse_qs
+              code = parse_qs(urlsplit(location).query)['code'][0]
+              tokens = oauth.exchange_token({
+                  'grant_type':['authorization_code'],
+                  'client_id':[client['client_id']],
+                  'code':[code],
+                  'redirect_uri':['https://chatgpt.com/connector/oauth/branch-test'],
+                  'code_verifier':[verifier],
+                  'resource':[oauth.resource],
+              })
+              assert oauth.validate_access_token(tokens['access_token'])
+              refreshed = oauth.exchange_token({
+                  'grant_type':['refresh_token'],
+                  'client_id':[client['client_id']],
+                  'refresh_token':[tokens['refresh_token']],
+                  'resource':[oauth.resource],
+              })
+              assert oauth.validate_access_token(refreshed['access_token'])
+              assert refreshed['refresh_token'] != tokens['refresh_token']
+              meta = oauth.authorization_server_metadata()
+              assert meta['registration_endpoint'].endswith('/oauth/register')
+              assert 'offline_access' in meta['scopes_supported']
+              print('oauth_unit_flow=success')
+          PY
