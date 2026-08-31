@@ -95,7 +95,7 @@ class RelayState:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "GoProxy/0.2"
+    server_version = "GoProxy/0.3"
 
     @property
     def state(self) -> RelayState:
@@ -118,6 +118,37 @@ class Handler(BaseHTTPRequestHandler):
         if value.lower().startswith("bearer "):
             return value[7:].strip()
         return ""
+
+    def _target_ready(self, parsed) -> bool:
+        health_path = parsed.path.rstrip("/") + "/health"
+        conn = http.client.HTTPSConnection(
+            parsed.hostname,
+            parsed.port or 443,
+            timeout=8,
+            context=ssl.create_default_context(),
+        )
+        try:
+            conn.request("GET", health_path, headers={
+                "Host": parsed.netloc,
+                "User-Agent": "GoProxy/0.3 readiness",
+                "Accept": "application/json",
+            })
+            resp = conn.getresponse()
+            body = resp.read(8192)
+            if resp.status != 200:
+                LOG.info("Upstream readiness %s returned HTTP %s", parsed.hostname, resp.status)
+                return False
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                LOG.info("Upstream readiness %s returned non-JSON health", parsed.hostname)
+                return False
+            return payload.get("ok") is True
+        except Exception as exc:
+            LOG.info("Upstream readiness %s failed: %s", parsed.hostname, exc)
+            return False
+        finally:
+            conn.close()
 
     def _register(self) -> None:
         if not self.state.authorized(self._bearer()):
@@ -142,8 +173,11 @@ class Handler(BaseHTTPRequestHandler):
                 LOG.info("Refusing unresolved upstream %s: %s", parsed.hostname, exc)
                 self._json(503, {"ok": False, "error": "target_dns_unresolved"})
                 return
+            if not self._target_ready(parsed):
+                self._json(503, {"ok": False, "error": "target_not_ready"})
+                return
             self.state.register(target)
-            LOG.info("Registered new upstream %s", parsed.hostname)
+            LOG.info("Registered ready upstream %s", parsed.hostname)
             self._json(200, {"ok": True, "registered": True})
         except (ValueError, json.JSONDecodeError) as exc:
             self._json(400, {"ok": False, "error": str(exc)})
