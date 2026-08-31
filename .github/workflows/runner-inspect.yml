@@ -1,0 +1,20 @@
+name: Inspect GoGo runner availability
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/runner-inspect.yml']
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read repository runner status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: gh api "repos/$REPO/actions/runners" --jq '.runners[] | {id,name,os,status,busy,labels:[.labels[].name]}'
