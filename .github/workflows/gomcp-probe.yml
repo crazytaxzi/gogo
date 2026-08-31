@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Inspect target runner
-        shell: powershell
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
           Write-Host "runner_name=$env:RUNNER_NAME"
