@@ -1,0 +1,8 @@
+[Unit]
+Description=Renew GoProxy public IP certificate
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/crazytaxzi/GoProxy/cert_renew.sh
