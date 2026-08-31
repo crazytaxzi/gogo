@@ -1,0 +1,27 @@
+name: Inspect gateway internals
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/gateway-deep-inspect.yml']
+
+jobs:
+  inspect:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Inspect gateway container and compose
+        shell: bash
+        run: |
+          set -u
+          echo '=== compose ==='
+          sudo sed -n '1,260p' /home/crazytaxzi/Neon_Wreckers_TTV_Overlay/compose.yaml || true
+          echo '=== gateway inspect ==='
+          sudo docker inspect neon-wreckers-gateway-1 --format '{{json .Mounts}}' || true
+          echo
+          sudo docker inspect neon-wreckers-gateway-1 --format '{{json .Config}}' || true
+          echo
+          echo '=== gateway files ==='
+          sudo docker exec neon-wreckers-gateway-1 sh -lc 'for f in /etc/nginx/nginx.conf /etc/nginx/conf.d/default.conf /etc/caddy/Caddyfile /etc/traefik/traefik.yml; do if [ -f "$f" ]; then echo ---$f---; sed -n "1,260p" "$f"; fi; done' || true
+          echo '=== networks ==='
+          sudo docker inspect neon-wreckers-gateway-1 --format '{{json .NetworkSettings.Networks}}' || true
+          echo
