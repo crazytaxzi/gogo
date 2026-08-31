@@ -13,8 +13,8 @@ jobs:
   cancel:
     runs-on: ubuntu-latest
     steps:
-      - name: Cancel superseded build-heavy deploy
+      - name: Cancel hung verifier
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: gh api --method POST "repos/$REPO/actions/runs/33356251699/cancel" || true
+        run: gh api --method POST "repos/$REPO/actions/runs/33356539303/cancel" || true
