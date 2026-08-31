@@ -20,6 +20,7 @@ const PID_FILE = path.join(STATE, 'supervisor.pid');
 const RELAY_REGISTER = process.env.GOMCP_RELAY_REGISTER || 'https://8.235.7.248/goproxy/admin/register';
 const LOCAL_HEALTH = 'http://127.0.0.1:8765/health';
 const RE_REGISTER_MS = 60_000;
+const REGISTER_RETRY_MS = 2_000;
 
 fs.mkdirSync(STATE, { recursive: true });
 fs.mkdirSync(LOGS, { recursive: true });
@@ -74,7 +75,7 @@ function postJson(url, token, payload, timeoutMs = 10000) {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
         'Content-Length': String(body.length),
-        'User-Agent': 'GoMCP-Supervisor/0.1',
+        'User-Agent': 'GoMCP-Supervisor/0.2',
       },
     }, res => {
       const chunks = [];
@@ -91,7 +92,12 @@ let server = null;
 let tunnel = null;
 let stopping = false;
 let currentUrl = '';
+let registeringUrl = '';
 let registerTimer = null;
+
+function removePublishedTunnel() {
+  try { fs.unlinkSync(TUNNEL_STATE_FILE); } catch {}
+}
 
 function pipeChild(child, label, logFile) {
   const file = path.join(LOGS, logFile);
@@ -106,7 +112,7 @@ function pipeChild(child, label, logFile) {
       for (const line of lines) {
         if (line.trim()) log(`${label}: ${line}`);
         const m = line.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
-        if (m) onTunnelUrl(m[0]).catch(err => log(`register error: ${err.message}`));
+        if (m) onTunnelUrl(m[0]).catch(err => log(`registration loop error: ${err.message}`));
       }
     });
   };
@@ -145,13 +151,34 @@ async function onTunnelUrl(url) {
   url = url.replace(/\/$/, '');
   if (currentUrl !== url) {
     currentUrl = url;
-    await fsp.writeFile(TUNNEL_STATE_FILE, JSON.stringify({ url, updatedAt: new Date().toISOString() }, null, 2) + '\n', 'utf8');
-    log(`quick tunnel url=${url}`);
+    removePublishedTunnel();
+    log(`quick tunnel discovered url=${url}; waiting for relay DNS readiness`);
   }
-  await registerCurrent();
-  if (!registerTimer) {
-    registerTimer = setInterval(() => registerCurrent().catch(err => log(`periodic registration error: ${err.message}`)), RE_REGISTER_MS);
-    registerTimer.unref();
+  if (registeringUrl === url) return;
+  registeringUrl = url;
+  try {
+    while (!stopping && currentUrl === url) {
+      try {
+        await registerCurrent();
+        if (stopping || currentUrl !== url) return;
+        await fsp.writeFile(
+          TUNNEL_STATE_FILE,
+          JSON.stringify({ url, registeredAt: new Date().toISOString() }, null, 2) + '\n',
+          'utf8',
+        );
+        log(`quick tunnel active url=${url}`);
+        if (!registerTimer) {
+          registerTimer = setInterval(() => registerCurrent().catch(err => log(`periodic registration error: ${err.message}`)), RE_REGISTER_MS);
+          registerTimer.unref();
+        }
+        return;
+      } catch (err) {
+        log(`relay not ready for ${url}: ${err.message}; retrying`);
+        await sleep(REGISTER_RETRY_MS);
+      }
+    }
+  } finally {
+    if (registeringUrl === url) registeringUrl = '';
   }
 }
 
@@ -161,9 +188,11 @@ async function registerCurrent() {
   try { secret = (await fsp.readFile(RELAY_SECRET_FILE, 'utf8')).trim(); }
   catch { throw new Error(`relay secret missing: ${RELAY_SECRET_FILE}`); }
   if (!secret) throw new Error('relay secret is empty');
-  const r = await postJson(RELAY_REGISTER, secret, { target: currentUrl });
+  const target = currentUrl;
+  const r = await postJson(RELAY_REGISTER, secret, { target });
   if (r.status < 200 || r.status >= 300) throw new Error(`relay registration failed status=${r.status} body=${r.body.slice(0, 300)}`);
-  log(`relay registration ok target=${currentUrl}`);
+  if (target !== currentUrl) throw new Error('tunnel changed during registration');
+  log(`relay registration ok target=${target}`);
   return true;
 }
 
@@ -172,6 +201,8 @@ async function startTunnel() {
   if (!fs.existsSync(CLOUDFLARED)) throw new Error(`cloudflared missing: ${CLOUDFLARED}`);
   if (!await waitForServer()) throw new Error('GoMCP server did not become healthy');
   currentUrl = '';
+  registeringUrl = '';
+  removePublishedTunnel();
   log('starting Cloudflare Quick Tunnel');
   tunnel = spawn(CLOUDFLARED, ['tunnel', '--no-autoupdate', '--url', 'http://127.0.0.1:8765', '--loglevel', 'info'], {
     cwd: HOME, windowsHide: true,
@@ -181,9 +212,15 @@ async function startTunnel() {
   pipeChild(tunnel, 'cloudflared', 'cloudflared.log');
   tunnel.on('exit', (code, signal) => {
     log(`cloudflared exited code=${code} signal=${signal}`);
-    tunnel = null; currentUrl = '';
+    tunnel = null;
+    currentUrl = '';
+    registeringUrl = '';
+    removePublishedTunnel();
     if (registerTimer) { clearInterval(registerTimer); registerTimer = null; }
-    if (!stopping) setTimeout(() => startTunnel().catch(err => { log(`tunnel restart failed: ${err.message}`); setTimeout(() => startTunnel().catch(e => log(`tunnel retry failed: ${e.message}`)), 5000).unref(); }), 3000).unref();
+    if (!stopping) setTimeout(() => startTunnel().catch(err => {
+      log(`tunnel restart failed: ${err.message}`);
+      setTimeout(() => startTunnel().catch(e => log(`tunnel retry failed: ${e.message}`)), 5000).unref();
+    }), 3000).unref();
   });
 }
 
@@ -205,6 +242,7 @@ function shutdown(signal) {
   stopping = true;
   log(`supervisor stopping signal=${signal}`);
   if (registerTimer) clearInterval(registerTimer);
+  removePublishedTunnel();
   try { if (tunnel) tunnel.kill(); } catch {}
   try { if (server) server.kill(); } catch {}
   try { fs.unlinkSync(PID_FILE); } catch {}
