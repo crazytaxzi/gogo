@@ -13,7 +13,8 @@ const { spawn, spawnSync, execFileSync } = require('child_process');
 
 const VERSION = '0.1.0';
 const PROTOCOL_CURRENT = '2026-07-28';
-const PROTOCOL_LEGACY = '2025-11-25';
+const PROTOCOL_LEGACY_CURRENT = '2025-11-25';
+const PROTOCOL_LEGACY = new Set(['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25']);
 const HOME = process.env.GOMCP_HOME || 'C:\\actions-runner\\GoMCP';
 const STATE_DIR = process.env.GOMCP_STATE || path.join(HOME, 'state');
 const TOKEN_FILE = process.env.GOMCP_TOKEN_FILE || path.join(STATE_DIR, 'mcp.token');
@@ -65,7 +66,6 @@ function jsonResponse(res, status, payload, extraHeaders = {}) {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': body.length,
     'Cache-Control': 'no-store',
-    'MCP-Protocol-Version': PROTOCOL_CURRENT,
     ...extraHeaders,
   });
   res.end(body);
@@ -376,41 +376,101 @@ function httpRequest(a) {
   });
 }
 
-function validateModernHeaders(req, body) {
-  const version = req.headers['mcp-protocol-version'];
+function requestProtocol(req, body) {
+  const headerVersion = String(req.headers['mcp-protocol-version'] || '').trim();
+  const meta = body && body.params && body.params._meta;
+  const metaVersion = meta && typeof meta === 'object'
+    ? String(meta['io.modelcontextprotocol/protocolVersion'] || '').trim()
+    : '';
+  if (body && body.method === 'initialize') {
+    const requested = body.params && String(body.params.protocolVersion || '').trim();
+    return { era: 'legacy', version: PROTOCOL_LEGACY.has(requested) ? requested : PROTOCOL_LEGACY_CURRENT };
+  }
+  if (headerVersion) {
+    if (headerVersion === PROTOCOL_CURRENT) return { era: 'modern', version: headerVersion };
+    if (PROTOCOL_LEGACY.has(headerVersion)) return { era: 'legacy', version: headerVersion };
+    throw new Error(`Unsupported MCP-Protocol-Version ${headerVersion}`);
+  }
+  if (metaVersion) {
+    if (metaVersion === PROTOCOL_CURRENT) return { era: 'modern', version: metaVersion };
+    if (PROTOCOL_LEGACY.has(metaVersion)) return { era: 'legacy', version: metaVersion };
+    throw new Error(`Unsupported MCP protocol version ${metaVersion}`);
+  }
+  return { era: 'legacy', version: '2025-03-26' };
+}
+
+function validateProtocolHeaders(req, body) {
+  const protocol = requestProtocol(req, body);
   const method = req.headers['mcp-method'];
   const name = req.headers['mcp-name'];
-  if (!version && !method && !name) return;
-  if (version && version !== PROTOCOL_CURRENT) throw new Error(`Unsupported MCP-Protocol-Version ${version}`);
   if (method && method !== body.method) throw new Error('Mcp-Method header does not match JSON-RPC method');
   const bodyName = body.params && (body.params.name || body.params.uri || body.params.taskId);
   if (name && bodyName && name !== bodyName) throw new Error('Mcp-Name header does not match request parameter');
+  return protocol;
+}
+
+function modernResult(result, protocol) {
+  if (!protocol || protocol.era !== 'modern') return result;
+  const existing = result && result._meta && typeof result._meta === 'object' ? result._meta : {};
+  return {
+    ...result,
+    _meta: {
+      ...existing,
+      'io.modelcontextprotocol/serverInfo': { name: 'GoMCP', version: VERSION },
+    },
+  };
 }
 
 async function handleRpc(req, res, body) {
   const id = body.id;
   const method = body.method;
   try {
-    validateModernHeaders(req, body);
+    const protocol = validateProtocolHeaders(req, body);
     if (method === 'initialize') {
-      const requested = body.params && body.params.protocolVersion;
-      const protocolVersion = requested === PROTOCOL_LEGACY ? PROTOCOL_LEGACY : PROTOCOL_CURRENT;
-      return jsonResponse(res, 200, rpcResult(id, { protocolVersion, capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'GoMCP', version: VERSION } }));
+      const requested = body.params && String(body.params.protocolVersion || '').trim();
+      const protocolVersion = PROTOCOL_LEGACY.has(requested) ? requested : PROTOCOL_LEGACY_CURRENT;
+      return jsonResponse(res, 200, rpcResult(id, {
+        protocolVersion,
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: { name: 'GoMCP', version: VERSION },
+      }));
     }
-    if (method === 'notifications/initialized') { res.writeHead(204, { 'Cache-Control': 'no-store' }); return res.end(); }
-    if (method === 'ping') return jsonResponse(res, 200, rpcResult(id, {}));
-    if (method === 'server/discover') return jsonResponse(res, 200, rpcResult(id, { protocolVersion: PROTOCOL_CURRENT, serverInfo: { name: 'GoMCP', version: VERSION }, capabilities: { tools: { listChanged: false } } }));
-    if (method === 'tools/list') return jsonResponse(res, 200, rpcResult(id, { tools: TOOLS, ttlMs: 300000, cacheScope: 'private' }));
+    if (method === 'notifications/initialized') {
+      res.writeHead(202, { 'Cache-Control': 'no-store' });
+      return res.end();
+    }
+    if (method === 'ping') return jsonResponse(res, 200, rpcResult(id, modernResult({}, protocol)));
+    if (method === 'server/discover') {
+      const result = {
+        supportedVersions: [PROTOCOL_CURRENT],
+        capabilities: { tools: { listChanged: false } },
+        ttlMs: 300000,
+        cacheScope: 'public',
+      };
+      return jsonResponse(res, 200, rpcResult(id, modernResult(result, { era: 'modern', version: PROTOCOL_CURRENT })));
+    }
+    if (method === 'tools/list') {
+      const result = { tools: TOOLS };
+      if (protocol.era === 'modern') {
+        result.ttlMs = 300000;
+        result.cacheScope = 'private';
+      }
+      return jsonResponse(res, 200, rpcResult(id, modernResult(result, protocol)));
+    }
     if (method === 'tools/call') {
-      const params = body.params || {}; const toolName = params.name; if (!toolName) throw new Error('params.name is required');
+      const params = body.params || {};
+      const toolName = params.name;
+      if (!toolName) throw new Error('params.name is required');
       const started = Date.now();
       try {
         const result = await callTool(toolName, params.arguments || {});
         const structured = { ok: true, tool: toolName, durationMs: Date.now() - started, result };
-        return jsonResponse(res, 200, rpcResult(id, { content: [{ type: 'text', text: clampText(JSON.stringify(structured, null, 2)) }], structuredContent: structured, isError: false }));
+        const callResult = { content: [{ type: 'text', text: clampText(JSON.stringify(structured, null, 2)) }], structuredContent: structured, isError: false };
+        return jsonResponse(res, 200, rpcResult(id, modernResult(callResult, protocol)));
       } catch (err) {
         const structured = { ok: false, tool: toolName, durationMs: Date.now() - started, error: err && err.message ? err.message : String(err) };
-        return jsonResponse(res, 200, rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(structured) }], structuredContent: structured, isError: true }));
+        const callResult = { content: [{ type: 'text', text: JSON.stringify(structured) }], structuredContent: structured, isError: true };
+        return jsonResponse(res, 200, rpcResult(id, modernResult(callResult, protocol)));
       }
     }
     return jsonResponse(res, 200, rpcError(id, -32601, `Method not found: ${method}`));
