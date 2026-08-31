@@ -191,11 +191,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             form = self._read_form()
             request_id = form.get("request_id", "")
-            owner_key = form.get("owner_key", "")
+            access_key = form.get("access_key", "")
             if not self.oauth.login_allowed(remote_ip):
                 raise OAuthError("access_denied", "Too many failed authorization attempts", status=429)
             try:
-                redirect = self.oauth.approve_authorization(request_id, owner_key)
+                redirect = self.oauth.finish_authorization(request_id, access_key, remote_ip)
             except OAuthError as exc:
                 if exc.error == "access_denied":
                     self.oauth.note_failed_login(remote_ip)
