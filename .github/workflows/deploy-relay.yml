@@ -24,7 +24,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile relay/goproxy.py relay/gateway_patch.py
+          python3 -m py_compile relay/goproxy.py relay/oauth.py relay/gateway_patch.py
           bash -n relay/gateway_sync.sh relay/certbot_pre.sh relay/certbot_post.sh relay/cert_renew.sh
 
       - name: Install under ~/GoProxy
@@ -35,6 +35,7 @@ jobs:
           mkdir -p "$install_dir/state"
           chmod 700 "$install_dir/state"
           install -m 0755 relay/goproxy.py "$install_dir/goproxy.py"
+          install -m 0644 relay/oauth.py "$install_dir/oauth.py"
           install -m 0755 relay/gateway_patch.py "$install_dir/gateway_patch.py"
           install -m 0755 relay/gateway_sync.sh "$install_dir/gateway_sync.sh"
           install -m 0755 relay/certbot_pre.sh "$install_dir/certbot_pre.sh"
@@ -44,14 +45,16 @@ jobs:
           install -m 0644 relay/goproxy-cert-renew.service "$install_dir/goproxy-cert-renew.service"
           install -m 0644 relay/goproxy-cert-renew.timer "$install_dir/goproxy-cert-renew.timer"
 
-          secret_file="$install_dir/state/register.secret"
-          if [[ ! -s "$secret_file" ]]; then
-            python3 - <<'PY' > "$secret_file"
+          for name in register upstream; do
+            secret_file="$install_dir/state/${name}.secret"
+            if [[ ! -s "$secret_file" ]]; then
+              python3 - <<'PY' > "$secret_file"
           import secrets
           print(secrets.token_urlsafe(48))
           PY
-            chmod 600 "$secret_file"
-          fi
+              chmod 600 "$secret_file"
+            fi
+          done
 
       - name: Install services and Certbot hooks
         shell: bash
@@ -88,7 +91,7 @@ jobs:
             echo 'renewal_hook_test=already_verified'
           fi
 
-      - name: Verify relay and renewal timer
+      - name: Verify relay, OAuth discovery and renewal timer
         shell: bash
         run: |
           set -euo pipefail
@@ -98,24 +101,45 @@ jobs:
           sudo systemctl is-enabled --quiet goproxy.service
           sudo systemctl is-active --quiet goproxy-cert-renew.timer
           sudo systemctl is-enabled --quiet goproxy-cert-renew.timer
+          test -s "$HOME/GoProxy/state/register.secret"
+          test -s "$HOME/GoProxy/state/upstream.secret"
 
           for i in {1..20}; do
             if curl --max-time 3 -fsS http://127.0.0.1:8787/health >/dev/null 2>&1 && \
-               curl --max-time 5 -fsS "https://${public_host}/goproxy/health" >/dev/null 2>&1; then
+               curl --max-time 5 -fsS "https://${public_host}/goproxy/health" >/dev/null 2>&1 && \
+               curl --max-time 5 -fsS "https://${public_host}/.well-known/oauth-protected-resource/goproxy/mcp" >/dev/null 2>&1 && \
+               curl --max-time 5 -fsS "https://${public_host}/.well-known/oauth-authorization-server/goproxy/oauth" >/dev/null 2>&1; then
               break
             fi
             sleep 1
           done
 
-          echo 'local:'
-          curl --max-time 3 -fsS http://127.0.0.1:8787/health
-          echo
-          echo 'public:'
-          curl --max-time 5 -fsS "https://${public_host}/goproxy/health"
-          echo
+          local_health="$(curl --max-time 3 -fsS http://127.0.0.1:8787/health)"
+          public_health="$(curl --max-time 5 -fsS "https://${public_host}/goproxy/health")"
+          prm="$(curl --max-time 5 -fsS "https://${public_host}/.well-known/oauth-protected-resource/goproxy/mcp")"
+          asmeta="$(curl --max-time 5 -fsS "https://${public_host}/.well-known/oauth-authorization-server/goproxy/oauth")"
+          python3 - "$public_host" "$local_health" "$public_health" "$prm" "$asmeta" <<'PY'
+          import json, sys
+          host, local_raw, public_raw, prm_raw, as_raw = sys.argv[1:]
+          local = json.loads(local_raw)
+          public = json.loads(public_raw)
+          prm = json.loads(prm_raw)
+          meta = json.loads(as_raw)
+          assert local['ok'] and local['oauth']
+          assert public['ok'] and public['oauth']
+          assert prm['resource'] == f'https://{host}/goproxy/mcp'
+          assert prm['authorization_servers'] == [f'https://{host}/goproxy/oauth']
+          assert meta['issuer'] == f'https://{host}/goproxy/oauth'
+          assert meta['registration_endpoint'] == f'https://{host}/goproxy/oauth/register'
+          assert meta['token_endpoint_auth_methods_supported'] == ['none']
+          assert 'refresh_token' in meta['grant_types_supported']
+          assert 'S256' in meta['code_challenge_methods_supported']
+          print('oauth_discovery=success')
+          PY
+
           sudo systemctl list-timers --all goproxy-cert-renew.timer --no-pager
           sudo openssl x509 -in "/etc/letsencrypt/live/${public_host}/fullchain.pem" -noout -dates
           echo "public_base=https://${public_host}/goproxy/"
           echo "mcp_endpoint=https://${public_host}/goproxy/mcp"
-          echo "registration_endpoint=https://${public_host}/goproxy/admin/register"
-          echo "registration_secret_file=$HOME/GoProxy/state/register.secret"
+          echo "oauth_issuer=https://${public_host}/goproxy/oauth"
+          echo "oauth_registration=https://${public_host}/goproxy/oauth/register"
