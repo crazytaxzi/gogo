@@ -11,6 +11,7 @@ on:
 jobs:
   deploy:
     runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 20
     steps:
       - name: Check out relay source
         uses: actions/checkout@v4
@@ -19,7 +20,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile relay/goproxy.py
+          python3 -m py_compile relay/goproxy.py relay/gateway_patch.py
 
       - name: Install under ~/GoProxy
         shell: bash
@@ -29,6 +30,7 @@ jobs:
           mkdir -p "$install_dir/state"
           chmod 700 "$install_dir/state"
           install -m 0755 relay/goproxy.py "$install_dir/goproxy.py"
+          install -m 0755 relay/gateway_patch.py "$install_dir/gateway_patch.py"
           install -m 0644 relay/goproxy.service "$install_dir/goproxy.service"
 
           secret_file="$install_dir/state/register.secret"
@@ -49,20 +51,43 @@ jobs:
           sudo systemctl enable --now goproxy.service
           sudo systemctl restart goproxy.service
 
-      - name: Verify service
+      - name: Wire relay into HTTPS gateway
         shell: bash
         run: |
           set -euo pipefail
-          for i in {1..20}; do
-            if curl -fsS http://127.0.0.1:8787/health; then
-              echo
+          project=/home/crazytaxzi/Neon_Wreckers_TTV_Overlay
+          python3 "$HOME/GoProxy/gateway_patch.py" --project "$project"
+          cd "$project"
+          sudo docker compose config >/dev/null
+          sudo docker compose build gateway
+          sudo docker compose run --rm --no-deps gateway nginx -t
+          sudo docker compose up -d --no-deps gateway
+
+      - name: Verify local and public relay
+        shell: bash
+        run: |
+          set -euo pipefail
+          project=/home/crazytaxzi/Neon_Wreckers_TTV_Overlay
+          public_host="$(sed -n 's/^PUBLIC_HOST=//p' "$project/.env" | tail -n1 | tr -d '\r\"')"
+          test -n "$public_host"
+
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:8787/health >/dev/null 2>&1 && \
+               curl -fsS "https://${public_host}/goproxy/health" >/dev/null 2>&1; then
               break
             fi
             sleep 1
           done
+
+          echo 'local:'
           curl -fsS http://127.0.0.1:8787/health
           echo
+          echo 'public:'
+          curl -fsS "https://${public_host}/goproxy/health"
+          echo
           sudo systemctl --no-pager --full status goproxy.service
-          ss -ltn | grep '127.0.0.1:8787'
-          echo "install_dir=$HOME/GoProxy"
+          sudo docker compose -f "$project/compose.yaml" ps gateway
+          echo "public_base=https://${public_host}/goproxy/"
+          echo "mcp_endpoint=https://${public_host}/goproxy/mcp"
+          echo "registration_endpoint=https://${public_host}/goproxy/admin/register"
           echo "registration_secret_file=$HOME/GoProxy/state/register.secret"
