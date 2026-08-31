@@ -20,43 +20,38 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import re
           p = Path('relay/oauth.py')
-          s = p.read_text(encoding='utf-8')
-          new = '''    @staticmethod
-              def _validate_redirect_uri(uri: str) -> str:
-                  parsed = urlsplit(uri)
-                  host = (parsed.hostname or "").lower().rstrip(".")
-                  chatgpt_owned = host == "chatgpt.com" or host.endswith(".chatgpt.com")
-                  try:
-                      port = parsed.port
-                  except ValueError:
-                      port = -1
-                  if (
-                      parsed.scheme.lower() != "https"
-                      or not chatgpt_owned
-                      or port not in (None, 443)
-                      or parsed.username
-                      or parsed.password
-                      or parsed.fragment
-                      or not parsed.path.startswith("/connector/oauth/")
-                  ):
-                      raise OAuthError(
-                          "invalid_redirect_uri",
-                          "GoMCP dynamic clients must use an HTTPS ChatGPT-owned /connector/oauth/ callback",
-                      )
-                  return urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, ""))
-
-          '''
-          # The YAML block removes the common indentation before Python executes;
-          # normalize only the extra 10 spaces carried by lines after the first.
-          lines = new.splitlines(True)
-          new = lines[0] + ''.join((line[10:] if line.startswith('          ') else line) for line in lines[1:])
-          pattern = r'    @staticmethod\n    def _validate_redirect_uri\(uri: str\) -> str:\n.*?(?=    def register_client\()'
-          s2, n = re.subn(pattern, new, s, count=1, flags=re.S)
-          if n != 1:
-              raise SystemExit(f'redirect validator replacement count={n}')
-          p.write_text(s2, encoding='utf-8')
+          lines = p.read_text(encoding='utf-8').splitlines(True)
+          start = lines.index('    @staticmethod\n', next(i for i,l in enumerate(lines) if 'def _validate_redirect_uri' in l) - 1)
+          end = next(i for i,l in enumerate(lines[start+1:], start+1) if l.startswith('    def register_client('))
+          replacement = [
+              '    @staticmethod\n',
+              '    def _validate_redirect_uri(uri: str) -> str:\n',
+              '        parsed = urlsplit(uri)\n',
+              '        host = (parsed.hostname or "").lower().rstrip(".")\n',
+              '        chatgpt_owned = host == "chatgpt.com" or host.endswith(".chatgpt.com")\n',
+              '        try:\n',
+              '            port = parsed.port\n',
+              '        except ValueError:\n',
+              '            port = -1\n',
+              '        if (\n',
+              '            parsed.scheme.lower() != "https"\n',
+              '            or not chatgpt_owned\n',
+              '            or port not in (None, 443)\n',
+              '            or parsed.username\n',
+              '            or parsed.password\n',
+              '            or parsed.fragment\n',
+              '            or not parsed.path.startswith("/connector/oauth/")\n',
+              '        ):\n',
+              '            raise OAuthError(\n',
+              '                "invalid_redirect_uri",\n',
+              '                "GoMCP dynamic clients must use an HTTPS ChatGPT-owned /connector/oauth/ callback",\n',
+              '            )\n',
+              '        return urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, ""))\n',
+              '\n',
+          ]
+          lines[start:end] = replacement
+          p.write_text(''.join(lines), encoding='utf-8')
           PY
           python3 -m py_compile relay/oauth.py relay/goproxy.py
           python3 - <<'PY'
