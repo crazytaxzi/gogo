@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Idempotently wire GoProxy into the existing Neon Wreckers nginx gateway."""
+"""Idempotently wire GoProxy and OAuth discovery into the existing Nginx gateway."""
 
 from __future__ import annotations
 
@@ -11,6 +11,30 @@ START = "  # BEGIN GOPROXY RELAY"
 END = "  # END GOPROXY RELAY"
 
 NGINX_BLOCK = r'''  # BEGIN GOPROXY RELAY
+  location = /.well-known/oauth-protected-resource {
+    proxy_pass http://host.docker.internal:8787;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+  }
+  location = /.well-known/oauth-protected-resource/goproxy/mcp {
+    proxy_pass http://host.docker.internal:8787;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+  }
+  location = /.well-known/oauth-authorization-server/goproxy/oauth {
+    proxy_pass http://host.docker.internal:8787;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+  }
   location = /goproxy { return 308 /goproxy/; }
   location ^~ /goproxy/ {
     proxy_pass http://host.docker.internal:8787/;
