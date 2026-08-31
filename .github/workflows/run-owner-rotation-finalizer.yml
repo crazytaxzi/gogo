@@ -1,0 +1,41 @@
+name: Run owner-rotation finalizer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/run-owner-rotation-finalizer.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch deployment workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/finalize_owner_rotation.py
+          git diff --check
+          git config user.name 'GoMCP Automation'
+          git config user.email 'actions@users.noreply.github.com'
+          git add .github/workflows/deploy-gomcp.yml .github/workflows/deploy-relay.yml
+          git commit -m 'Make rotated owner verifier durable'
+          git push origin HEAD:main
+
+  retire:
+    needs: patch
+    runs-on: [self-hosted, GoMCP]
+    timeout-minutes: 5
+    steps:
+      - name: Remove retired GAMEPC owner token
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $old = 'C:\actions-runner\GoMCP\state\mcp.token'
+          if (Test-Path $old) { Remove-Item -Force $old }
+          Write-Host 'retired_gamepc_owner_token_removed=yes'
