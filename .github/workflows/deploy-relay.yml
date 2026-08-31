@@ -2,7 +2,7 @@ name: Deploy GoProxy relay
 
 on:
   push:
-    branches: [relay-build]
+    branches: [main]
     paths:
       - 'relay/**'
       - '.github/workflows/deploy-relay.yml'
