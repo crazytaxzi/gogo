@@ -1,6 +1,6 @@
 [Unit]
 Description=GoProxy rotating Quick Tunnel relay
-After=network-online.target
+After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
@@ -8,7 +8,7 @@ Type=simple
 User=crazytaxzi
 Group=crazytaxzi
 WorkingDirectory=/home/crazytaxzi/GoProxy
-ExecStart=/usr/bin/python3 /home/crazytaxzi/GoProxy/goproxy.py --listen 127.0.0.1:8787
+ExecStart=/usr/bin/python3 /home/crazytaxzi/GoProxy/goproxy.py --listen 0.0.0.0:8787
 Restart=always
 RestartSec=2
 TimeoutStopSec=10
