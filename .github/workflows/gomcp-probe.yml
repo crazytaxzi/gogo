@@ -26,4 +26,5 @@ jobs:
           command -v systemctl || true
           command -v cloudflared || true
           command -v curl || true
+          command -v openssl || true
           sudo -n true && echo 'sudo_nopasswd=yes' || echo 'sudo_nopasswd=no'
