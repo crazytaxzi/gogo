@@ -35,7 +35,9 @@ jobs:
           python3 -m py_compile relay/goproxy.py relay/admin_auth.py relay/oauth.py relay/tool_policy.py
           python3 relay/selftest.py
           python3 - <<'PY'
-          from relay.goproxy import Handler, PUBLIC_ORIGIN
+          import sys
+          sys.path.insert(0, 'relay')
+          from goproxy import Handler, PUBLIC_ORIGIN
           class OAuth: public_origin = PUBLIC_ORIGIN
           class Server: oauth = OAuth()
           h = object.__new__(Handler)
