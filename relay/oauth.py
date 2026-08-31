@@ -89,8 +89,6 @@ class OAuthManager:
         except FileNotFoundError:
             return self._blank_state()
         except Exception:
-            # Do not brick the relay because of a damaged OAuth cache. Preserve the
-            # broken file for inspection and start clean; no owner credential lives here.
             try:
                 damaged = self.state_file.with_suffix(
                     self.state_file.suffix + f".damaged.{int(time.time())}"
@@ -162,7 +160,6 @@ class OAuthManager:
         unknown = set(parts) - allowed
         if unknown:
             raise OAuthError("invalid_scope", f"Unsupported scope: {sorted(unknown)[0]}")
-        # GoMCP access is the actual permission. offline_access controls durable refresh.
         if "gomcp" not in parts:
             parts.insert(0, "gomcp")
         if "offline_access" not in parts:
@@ -364,9 +361,7 @@ class OAuthManager:
                 raise OAuthError("invalid_request", "Authorization request expired")
             client = self._get_client_locked(str(request["client_id"]))
             client_name = str(client.get("client_name", "ChatGPT"))
-        error_html = (
-            f'<div class="error">{html.escape(error)}</div>' if error else ""
-        )
+        error_html = f'<div class="error">{html.escape(error)}</div>' if error else ""
         return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Authorize GoMCP</title>
@@ -405,8 +400,7 @@ button{{margin-top:18px;width:100%;padding:12px;border:0;border-radius:999px;bac
             if not isinstance(request, dict) or float(request.get("expires_at", 0)) <= time.time():
                 raise OAuthError("invalid_request", "Authorization request expired")
             code = self._token("code_")
-            code_hash = self._hash_secret(code)
-            self._state["codes"][code_hash] = {
+            self._state["codes"][self._hash_secret(code)] = {
                 **request,
                 "expires_at": time.time() + self.CODE_TTL,
             }
@@ -426,9 +420,7 @@ button{{margin-top:18px;width:100%;padding:12px;border:0;border-radius:999px;bac
         actual = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
         return hmac.compare_digest(actual, expected)
 
-    def _issue_tokens_locked(
-        self, client_id: str, scope: list[str], resource: str
-    ) -> dict[str, Any]:
+    def _issue_tokens_locked(self, client_id: str, scope: list[str], resource: str) -> dict[str, Any]:
         now = time.time()
         access_token = self._token("at_")
         refresh_token = self._token("rt_")
@@ -524,9 +516,7 @@ button{{margin-top:18px;width:100%;padding:12px;border:0;border-radius:999px;bac
                     scope = requested
                 else:
                     scope = original_scope
-                result = self._issue_tokens_locked(
-                    client_id, scope, str(row.get("resource", self.resource))
-                )
+                result = self._issue_tokens_locked(client_id, scope, str(row.get("resource", self.resource)))
                 self._state["clients"][client_id]["last_used_at"] = time.time()
                 self._save_locked()
                 return result
@@ -552,14 +542,13 @@ button{{margin-top:18px;width:100%;padding:12px;border:0;border-radius:999px;bac
             return isinstance(scope, list) and required_scope in scope
 
     def bearer_challenge(self, invalid_token: bool = False) -> str:
-        parts = [
-            "Bearer",
-            f'resource_metadata="{self.protected_resource_metadata_url}"',
-            'scope="gomcp"',
-        ]
+        challenge = (
+            f'Bearer resource_metadata="{self.protected_resource_metadata_url}", '
+            'scope="gomcp"'
+        )
         if invalid_token:
-            parts.append('error="invalid_token"')
-        return ", ".join(parts)
+            challenge += ', error="invalid_token"'
+        return challenge
 
     @staticmethod
     def parse_form(body: bytes) -> dict[str, list[str]]:
