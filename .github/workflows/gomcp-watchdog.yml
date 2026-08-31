@@ -1,6 +1,9 @@
 name: GoMCP watchdog
 
 on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/gomcp-watchdog.yml']
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:
@@ -17,22 +20,18 @@ jobs:
     runs-on: [self-hosted, GoMCP]
     timeout-minutes: 5
     steps:
-      - name: Ensure GoMCP supervisor is alive
+      - name: Ensure GoMCP supervisor and relay are healthy
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
           $install = 'C:\actions-runner\GoMCP'
           $state = Join-Path $install 'state'
           $supervisor = Join-Path $install 'supervisor.js'
+          $tunnelFile = Join-Path $state 'tunnel.json'
+          $relaySecretFile = Join-Path $state 'relay.secret'
           if (-not (Test-Path $supervisor)) { throw 'GoMCP is not installed yet' }
 
-          $healthy = $false
-          try {
-            $h = Invoke-RestMethod -UseBasicParsing -Uri 'http://127.0.0.1:8765/health' -TimeoutSec 3
-            $healthy = [bool]($h.ok -and $h.toolCount -eq 50)
-          } catch {}
-
-          if (-not $healthy) {
+          function Restart-GoMCP {
             $pidFile = Join-Path $state 'supervisor.pid'
             if (Test-Path $pidFile) {
               try {
@@ -41,22 +40,56 @@ jobs:
               } catch {}
               Remove-Item -Force $pidFile -ErrorAction SilentlyContinue
             }
+            Remove-Item -Force $tunnelFile -ErrorAction SilentlyContinue
             $node = (Get-Command node.exe -ErrorAction Stop).Source
             $env:RUNNER_TRACKING_ID = 'gomcp-daemon'
             $p = Start-Process -FilePath $node -ArgumentList @($supervisor) -WorkingDirectory $install -WindowStyle Hidden -PassThru
             Write-Host "gomcp_restarted_pid=$($p.Id)"
+          }
+
+          $localHealthy = $false
+          try {
+            $h = Invoke-RestMethod -UseBasicParsing -Uri 'http://127.0.0.1:8765/health' -TimeoutSec 3
+            $localHealthy = [bool]($h.ok -and $h.toolCount -eq 50)
+          } catch {}
+
+          if (-not $localHealthy -or -not (Test-Path $tunnelFile)) {
+            Restart-GoMCP
           } else {
             Write-Host 'gomcp_local=healthy'
           }
 
           $ok = $false
-          for ($i=0; $i -lt 45; $i++) {
+          for ($i=0; $i -lt 75; $i++) {
             try {
               $h = Invoke-RestMethod -UseBasicParsing -Uri 'http://127.0.0.1:8765/health' -TimeoutSec 2
+              if (-not $h.ok -or $h.toolCount -ne 50 -or -not (Test-Path $tunnelFile)) {
+                Start-Sleep -Seconds 1
+                continue
+              }
+
+              $tunnel = Get-Content $tunnelFile -Raw | ConvertFrom-Json
+              $tunnelHost = ([Uri]$tunnel.url).Host
               $r = Invoke-RestMethod -UseBasicParsing -Uri 'https://8.235.7.248/goproxy/health' -TimeoutSec 5
-              if ($h.ok -and $h.toolCount -eq 50 -and $r.ok -and $r.upstream_registered) { $ok = $true; break }
+              if ($r.ok -and $r.upstream_registered -and $r.upstream_host -eq $tunnelHost) {
+                $ok = $true
+                break
+              }
+
+              if (Test-Path $relaySecretFile) {
+                $relaySecret = (Get-Content $relaySecretFile -Raw).Trim()
+                $headers = @{ Authorization = "Bearer $relaySecret" }
+                $body = @{ target = $tunnel.url } | ConvertTo-Json -Compress
+                try {
+                  Invoke-RestMethod -UseBasicParsing -Method Post -Uri 'https://8.235.7.248/goproxy/admin/register' -Headers $headers -ContentType 'application/json' -Body $body -TimeoutSec 10 | Out-Null
+                  Write-Host 'relay_registration_refreshed=yes'
+                } catch {
+                  Write-Host 'relay_registration_pending=yes'
+                }
+              }
             } catch {}
             Start-Sleep -Seconds 1
           }
+
           if (-not $ok) { throw 'GoMCP or relay is not healthy after watchdog recovery' }
-          Write-Host 'gomcp_watchdog=healthy relay_registered=yes'
+          Write-Host 'gomcp_watchdog=healthy relay_current=yes'
