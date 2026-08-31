@@ -1,0 +1,28 @@
+name: Inspect relay front door
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/frontdoor-inspect.yml']
+
+jobs:
+  inspect:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Inspect existing listeners and web services
+        shell: bash
+        run: |
+          set -u
+          echo '=== listeners ==='
+          sudo ss -ltnp | grep -E ':(80|443)\b' || true
+          echo '=== services ==='
+          for s in caddy nginx apache2 traefik; do
+            echo "--- $s ---"
+            sudo systemctl --no-pager --full status "$s.service" 2>/dev/null | head -n 18 || true
+          done
+          echo '=== caddy config ==='
+          if [[ -f /etc/caddy/Caddyfile ]]; then sudo sed -n '1,220p' /etc/caddy/Caddyfile; fi
+          echo '=== nginx enabled sites ==='
+          if [[ -d /etc/nginx/sites-enabled ]]; then
+            sudo grep -R -nE 'server_name|listen|proxy_pass' /etc/nginx/sites-enabled 2>/dev/null || true
+          fi
