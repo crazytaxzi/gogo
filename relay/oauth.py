@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Small single-owner OAuth 2.1 authorization server for GoMCP.
+"""Standards-oriented OAuth 2.0 authorization server for GoMCP.
 
-The public OAuth authority is anchored to the stable GoProxy URL. Dynamic clients are
-restricted to HTTPS redirect URIs on chatgpt.com. Authorization uses a high-entropy
-owner key whose SHA-256 verifier is synchronized from GAMEPC; the key itself never
-leaves GAMEPC except when the owner submits it over HTTPS on the authorization form.
+Human authentication is handled separately by GoProxy's administrator login.
+This module owns OAuth client registration, authorization transactions, PKCE,
+access/refresh token issuance, and protected-resource validation.
 """
 
 from __future__ import annotations
@@ -12,7 +11,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import html
 import json
 import os
 import re
@@ -26,7 +24,6 @@ from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 
 _PKCE_VERIFIER_RE = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
-_HEX_256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class OAuthError(Exception):
@@ -43,17 +40,13 @@ class OAuthManager:
     CODE_TTL = 180
     REQUEST_TTL = 3600
     MAX_CLIENTS = 200
-    MAX_FAILED_LOGINS = 8
-    FAILED_LOGIN_WINDOW = 600
 
     def __init__(
         self,
         state_file: Path,
-        owner_hash_file: Path,
         public_origin: str = "https://8.235.7.248",
     ) -> None:
         self.state_file = state_file
-        self.owner_hash_file = owner_hash_file
         self.public_origin = public_origin.rstrip("/")
         self.resource = f"{self.public_origin}/goproxy/mcp"
         self.issuer = f"{self.public_origin}/goproxy/oauth"
@@ -67,7 +60,6 @@ class OAuthManager:
         self.token_endpoint = f"{self.issuer}/token"
         self.registration_endpoint = f"{self.issuer}/register"
         self.lock = threading.RLock()
-        self.failed_logins: dict[str, list[float]] = {}
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self._state = self._load()
 
@@ -115,11 +107,8 @@ class OAuthManager:
                 fh.write("\n")
                 fh.flush()
                 os.fsync(fh.fileno())
+            os.chmod(temp_name, 0o600)
             os.replace(temp_name, self.state_file)
-            try:
-                os.chmod(self.state_file, 0o600)
-            except OSError:
-                pass
         finally:
             try:
                 os.unlink(temp_name)
@@ -323,6 +312,7 @@ class OAuthManager:
             if redirect_uri not in client.get("redirect_uris", []):
                 raise OAuthError("invalid_request", "redirect_uri is not registered")
             request_id = self._token("req_")
+            now = time.time()
             self._state["authorization_requests"][request_id] = {
                 "client_id": client_id,
                 "redirect_uri": redirect_uri,
@@ -331,87 +321,48 @@ class OAuthManager:
                 "code_challenge_method": "S256",
                 "scope": scopes,
                 "resource": self.resource,
-                "created_at": time.time(),
-                "expires_at": time.time() + self.REQUEST_TTL,
+                "created_at": now,
+                "expires_at": now + self.REQUEST_TTL,
             }
-            client["last_used_at"] = time.time()
+            client["last_used_at"] = now
             self._save_locked()
         return request_id
 
-    def _owner_hash(self) -> str:
-        try:
-            value = self.owner_hash_file.read_text(encoding="ascii").strip().lower()
-        except FileNotFoundError as exc:
-            raise OAuthError(
-                "temporarily_unavailable",
-                "GoMCP owner authorization has not been synchronized yet",
-                status=503,
-            ) from exc
-        if not _HEX_256_RE.fullmatch(value):
-            raise OAuthError(
-                "server_error", "GoMCP owner authorization verifier is invalid", status=500
-            )
-        return value
-
-    def login_allowed(self, remote_ip: str) -> bool:
-        now = time.time()
-        with self.lock:
-            recent = [
-                stamp
-                for stamp in self.failed_logins.get(remote_ip, [])
-                if stamp > now - self.FAILED_LOGIN_WINDOW
-            ]
-            self.failed_logins[remote_ip] = recent
-            return len(recent) < self.MAX_FAILED_LOGINS
-
-    def note_failed_login(self, remote_ip: str) -> None:
-        with self.lock:
-            self.failed_logins.setdefault(remote_ip, []).append(time.time())
-
-    def authorization_form(self, request_id: str, error: str = "") -> str:
+    def get_authorization_request(self, request_id: str) -> dict[str, Any]:
+        if not request_id:
+            raise OAuthError("invalid_request", "Authorization request is missing")
         with self.lock:
             request = self._state["authorization_requests"].get(request_id)
-            if not isinstance(request, dict) or float(request.get("expires_at", 0)) <= time.time():
+            if not isinstance(request, dict):
+                raise OAuthError("invalid_request", "Authorization request was not found")
+            if float(request.get("expires_at", 0)) <= time.time():
+                self._state["authorization_requests"].pop(request_id, None)
+                self._save_locked()
                 raise OAuthError("invalid_request", "Authorization request expired")
-            client = self._get_client_locked(str(request["client_id"]))
-            client_name = str(client.get("client_name", "ChatGPT"))
-        error_html = f'<div class="error">{html.escape(error)}</div>' if error else ""
-        return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Authorize GoMCP</title>
-<style>
-body{{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#151515;color:#eee;margin:0;display:grid;place-items:center;min-height:100vh}}
-main{{width:min(520px,calc(100% - 32px));background:#232323;border:1px solid #444;border-radius:16px;padding:28px;box-sizing:border-box}}
-h1{{margin:0 0 8px;font-size:24px}}p{{color:#c9c9c9;line-height:1.5}}label{{display:block;margin:20px 0 8px;font-weight:600}}
-input{{width:100%;box-sizing:border-box;padding:12px;border-radius:9px;border:1px solid #666;background:#151515;color:#fff;font-size:16px}}
-button{{margin-top:18px;width:100%;padding:12px;border:0;border-radius:999px;background:#fff;color:#111;font-weight:700;font-size:16px;cursor:pointer}}
-.error{{background:#4a211c;border:1px solid #a44;color:#ffd5cc;padding:10px;border-radius:8px;margin:14px 0}}
-.small{{font-size:13px;color:#aaa}}
-</style></head><body><main>
-<h1>Authorize GoMCP</h1>
-<p><strong>{html.escape(client_name)}</strong> is requesting access to the GamePC MCP server. This grants access to the tools exposed by GoMCP.</p>
-{error_html}
-<form method="post" action="/goproxy/oauth/authorize" autocomplete="off">
-<input type="hidden" name="request_id" value="{html.escape(request_id, quote=True)}">
-<label for="access_key">GoMCP owner key</label>
-<input id="access_key" name="access_key" type="password" required autofocus autocomplete="current-password">
-<button type="submit">Authorize ChatGPT</button>
-</form>
-<p class="small">The owner key is stored only on GAMEPC at C:\\actions-runner\\GoMCP\\state\\mcp.token.</p>
-</main></body></html>"""
+            client = self._get_client_locked(str(request.get("client_id", "")))
+            return {
+                "request_id": request_id,
+                "client_id": request["client_id"],
+                "client_name": str(client.get("client_name", "ChatGPT")),
+                "scope": list(request.get("scope", [])),
+                "created_at": request.get("created_at"),
+                "expires_at": request.get("expires_at"),
+            }
 
-    def finish_authorization(self, request_id: str, access_key: str, remote_ip: str) -> str:
-        if not self.login_allowed(remote_ip):
-            raise OAuthError("access_denied", "Too many failed owner-key attempts", status=429)
-        owner_hash = self._owner_hash()
-        supplied_hash = self._hash_secret(access_key)
-        if not hmac.compare_digest(owner_hash, supplied_hash):
-            self.note_failed_login(remote_ip)
-            raise OAuthError("access_denied", "Owner key is incorrect", status=401)
+    def _authorization_redirect(self, request: dict[str, Any], params: dict[str, str]) -> str:
+        params = {**params, "iss": self.issuer}
+        if request.get("state"):
+            params["state"] = str(request["state"])
+        separator = "&" if "?" in str(request["redirect_uri"]) else "?"
+        return str(request["redirect_uri"]) + separator + urlencode(params)
 
+    def approve_authorization(self, request_id: str) -> str:
         with self.lock:
             request = self._state["authorization_requests"].pop(request_id, None)
-            if not isinstance(request, dict) or float(request.get("expires_at", 0)) <= time.time():
+            if not isinstance(request, dict):
+                raise OAuthError("invalid_request", "Authorization request was not found")
+            if float(request.get("expires_at", 0)) <= time.time():
+                self._save_locked()
                 raise OAuthError("invalid_request", "Authorization request expired")
             code = self._token("code_")
             self._state["codes"][self._hash_secret(code)] = {
@@ -419,12 +370,18 @@ button{{margin-top:18px;width:100%;padding:12px;border:0;border-radius:999px;bac
                 "expires_at": time.time() + self.CODE_TTL,
             }
             self._save_locked()
+        return self._authorization_redirect(request, {"code": code})
 
-        params = {"code": code, "iss": self.issuer}
-        if request.get("state"):
-            params["state"] = str(request["state"])
-        separator = "&" if "?" in str(request["redirect_uri"]) else "?"
-        return str(request["redirect_uri"]) + separator + urlencode(params)
+    def deny_authorization(self, request_id: str) -> str:
+        with self.lock:
+            request = self._state["authorization_requests"].pop(request_id, None)
+            if not isinstance(request, dict):
+                raise OAuthError("invalid_request", "Authorization request was not found")
+            self._save_locked()
+        return self._authorization_redirect(
+            request,
+            {"error": "access_denied", "error_description": "The administrator denied access"},
+        )
 
     @staticmethod
     def _pkce_matches(verifier: str, expected: str) -> bool:
@@ -530,7 +487,9 @@ button{{margin-top:18px;width:100%;padding:12px;border:0;border-radius:999px;bac
                     scope = requested
                 else:
                     scope = original_scope
-                result = self._issue_tokens_locked(client_id, scope, str(row.get("resource", self.resource)))
+                result = self._issue_tokens_locked(
+                    client_id, scope, str(row.get("resource", self.resource))
+                )
                 self._state["clients"][client_id]["last_used_at"] = time.time()
                 self._save_locked()
                 return result
@@ -563,6 +522,16 @@ button{{margin-top:18px;width:100%;padding:12px;border:0;border-radius:999px;bac
         if invalid_token:
             challenge += ', error="invalid_token"'
         return challenge
+
+    def stats(self) -> dict[str, int]:
+        with self.lock:
+            self._prune_locked()
+            return {
+                "clients": len(self._state["clients"]),
+                "authorization_requests": len(self._state["authorization_requests"]),
+                "access_tokens": len(self._state["access_tokens"]),
+                "refresh_tokens": len(self._state["refresh_tokens"]),
+            }
 
     @staticmethod
     def parse_form(body: bytes) -> dict[str, list[str]]:
