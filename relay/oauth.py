@@ -193,21 +193,26 @@ class OAuthManager:
     @staticmethod
     def _validate_redirect_uri(uri: str) -> str:
         parsed = urlsplit(uri)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        chatgpt_owned = host == "chatgpt.com" or host.endswith(".chatgpt.com")
+        try:
+            port = parsed.port
+        except ValueError:
+            port = -1
         if (
-            parsed.scheme != "https"
-            or parsed.hostname is None
-            or parsed.hostname.lower() != "chatgpt.com"
+            parsed.scheme.lower() != "https"
+            or not chatgpt_owned
+            or port not in (None, 443)
             or parsed.username
             or parsed.password
             or parsed.fragment
-            or parsed.query
             or not parsed.path.startswith("/connector/oauth/")
         ):
             raise OAuthError(
                 "invalid_redirect_uri",
-                "GoMCP dynamic clients must use an HTTPS chatgpt.com /connector/oauth/ callback",
+                "GoMCP dynamic clients must use an HTTPS ChatGPT-owned /connector/oauth/ callback",
             )
-        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+        return urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, ""))
 
     def register_client(self, metadata: dict[str, Any]) -> dict[str, Any]:
         redirects = metadata.get("redirect_uris")
