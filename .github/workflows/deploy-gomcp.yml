@@ -5,7 +5,6 @@ on:
     branches: [main]
     paths:
       - 'mcp/**'
-      - 'relay/owner-token.sha256'
       - '.github/workflows/deploy-gomcp.yml'
   workflow_dispatch:
 
@@ -50,8 +49,7 @@ jobs:
     outputs:
       ciphertext: ${{ steps.wrap.outputs.ciphertext }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Synchronize owner verifier and encrypt relay credentials
+      - name: Encrypt relay credentials for GoMCP
         id: wrap
         shell: bash
         env:
@@ -61,11 +59,6 @@ jobs:
           state="$HOME/GoProxy/state"
           mkdir -p "$state"
           chmod 700 "$state"
-
-          owner_hash="$(tr -d '\r\n ' < relay/owner-token.sha256)"
-          [[ "$owner_hash" =~ ^[0-9a-f]{64}$ ]]
-          umask 077
-          printf '%s\n' "$owner_hash" > "$state/owner-token.sha256"
 
           for name in register upstream; do
             file="$state/${name}.secret"
@@ -78,6 +71,7 @@ jobs:
             fi
           done
 
+          umask 077
           tmp="$(mktemp -d)"
           trap 'rm -rf "$tmp"' EXIT
           printf '%s' "$PUBLIC_KEY_B64" | base64 -d > "$tmp/public.pem"
@@ -98,7 +92,7 @@ jobs:
             -in "$tmp/payload.json" -out "$tmp/wrapped.bin"
           ciphertext="$(base64 -w0 "$tmp/wrapped.bin")"
           echo "ciphertext=$ciphertext" >> "$GITHUB_OUTPUT"
-          echo 'relay_bundle_wrapped=yes owner_verifier=repository_managed'
+          echo 'relay_bundle_wrapped=yes human_auth=relay_admin_login'
 
   deploy:
     needs: wrap-relay-bundle
@@ -124,7 +118,8 @@ jobs:
             Remove-Item -Force $pidFile -ErrorAction SilentlyContinue
           }
           Remove-Item -Force (Join-Path $state 'tunnel.json') -ErrorAction SilentlyContinue
-          Write-Host 'prior_gomcp=stopped_or_absent'
+          Remove-Item -Force (Join-Path $state 'mcp.token') -ErrorAction SilentlyContinue
+          Write-Host 'prior_gomcp=stopped_or_absent legacy_owner_token=absent'
 
       - name: Install GoMCP, relay credentials and cloudflared
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
@@ -173,7 +168,7 @@ jobs:
           [IO.File]::WriteAllText((Join-Path $state 'relay.secret'), [string]$bundle.relay_secret, [Text.UTF8Encoding]::new($false))
           [IO.File]::WriteAllText((Join-Path $state 'upstream.secret'), [string]$bundle.upstream_secret, [Text.UTF8Encoding]::new($false))
           Remove-Item -Force (Join-Path $state 'mcp.token') -ErrorAction SilentlyContinue
-          Write-Host 'relay_credentials=installed owner_verifier=repository_managed legacy_owner_token=retired'
+          Write-Host 'relay_credentials=installed legacy_owner_token=retired'
 
       - name: Start detached GoMCP supervisor
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
@@ -225,12 +220,12 @@ jobs:
           for ($i=0; $i -lt 30; $i++) {
             try {
               $relay = Invoke-RestMethod -UseBasicParsing -Uri 'https://gomcp-8-235-7-248.nip.io/goproxy/health' -TimeoutSec 5
-              if ($relay.ok -and $relay.oauth -and $relay.upstream_registered -and $relay.upstream_host -eq ([Uri]$tunnel.url).Host) { break }
+              if ($relay.ok -and $relay.oauth -and $relay.admin_auth -and $relay.upstream_registered -and $relay.upstream_host -eq ([Uri]$tunnel.url).Host) { break }
             } catch {}
             Start-Sleep -Seconds 1
           }
-          if (-not $relay -or -not $relay.ok -or $relay.upstream_host -ne ([Uri]$tunnel.url).Host) { throw 'stable relay is not synchronized to current Quick Tunnel' }
-          Write-Host "gomcp_local=healthy tools=50 quick_tunnel=$($tunnel.url) relay_current=yes"
+          if (-not $relay -or -not $relay.ok -or -not $relay.admin_auth -or $relay.upstream_host -ne ([Uri]$tunnel.url).Host) { throw 'stable relay is not synchronized to current Quick Tunnel' }
+          Write-Host "gomcp_local=healthy tools=50 quick_tunnel=$($tunnel.url) relay_current=yes admin_login=yes"
 
       - name: Verify OAuth discovery and DCR contract
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
@@ -249,24 +244,26 @@ jobs:
           } | ConvertTo-Json -Compress
           $client = Invoke-RestMethod -UseBasicParsing -Method Post -Uri $meta.registration_endpoint -ContentType 'application/json' -Body $payload -TimeoutSec 10
           if (-not $client.client_id) { throw 'DCR probe failed' }
-          Write-Host 'oauth_discovery=success dcr=success owner_verifier=repository_managed'
+          Write-Host 'oauth_discovery=success dcr=success human_auth=relay_admin_login'
 
   external-probe:
     needs: deploy
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Prove OAuth discovery and MCP protection externally
+      - name: Prove OAuth login discovery and MCP protection externally
         shell: bash
         run: |
           set -euo pipefail
           base='https://gomcp-8-235-7-248.nip.io'
           prm="$(curl --max-time 20 -fsS "$base/.well-known/oauth-protected-resource/goproxy/mcp")"
           meta="$(curl --max-time 20 -fsS "$base/.well-known/oauth-authorization-server/goproxy/oauth")"
+          login="$(curl --max-time 20 -fsS "$base/goproxy/login")"
           printf '%s' "$prm" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['resource']=='https://gomcp-8-235-7-248.nip.io/goproxy/mcp'"
           printf '%s' "$meta" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['registration_endpoint'].endswith('/goproxy/oauth/register'); assert d['authorization_response_iss_parameter_supported'] is True"
+          grep -q 'GoMCP Admin Login' <<< "$login"
           body='{"jsonrpc":"2.0","id":99,"method":"ping","params":{}}'
           code="$(curl --max-time 20 -sS -D /tmp/headers -o /tmp/body -w '%{http_code}' -H 'Content-Type: application/json' --data "$body" "$base/goproxy/mcp")"
           test "$code" = '401'
           grep -qi 'www-authenticate:.*Bearer' /tmp/headers
-          echo 'external_hostname_tls_oauth=success mcp_protected=yes'
+          echo 'external_hostname_tls_oauth=success admin_login=success mcp_protected=yes'
