@@ -1,0 +1,27 @@
+[Unit]
+Description=GoProxy rotating Quick Tunnel relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=crazytaxzi
+Group=crazytaxzi
+WorkingDirectory=/home/crazytaxzi/GoProxy
+ExecStart=/usr/bin/python3 /home/crazytaxzi/GoProxy/goproxy.py --listen 127.0.0.1:8787
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/crazytaxzi/GoProxy/state
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
