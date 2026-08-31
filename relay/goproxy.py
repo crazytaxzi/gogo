@@ -9,6 +9,7 @@ import http.client
 import json
 import logging
 import os
+import socket
 import ssl
 import tempfile
 import threading
@@ -94,7 +95,7 @@ class RelayState:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "GoProxy/0.1"
+    server_version = "GoProxy/0.2"
 
     @property
     def state(self) -> RelayState:
@@ -128,18 +129,33 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("invalid body length")
             data = json.loads(self.rfile.read(length))
             target = str(data.get("target", "")).strip()
+            self.state._validate_target(target)
+            parsed = urlsplit(target)
+            try:
+                socket.getaddrinfo(
+                    parsed.hostname,
+                    parsed.port or 443,
+                    family=socket.AF_UNSPEC,
+                    type=socket.SOCK_STREAM,
+                )
+            except socket.gaierror as exc:
+                LOG.info("Refusing unresolved upstream %s: %s", parsed.hostname, exc)
+                self._json(503, {"ok": False, "error": "target_dns_unresolved"})
+                return
             self.state.register(target)
-            LOG.info("Registered new upstream %s", urlsplit(target).hostname)
+            LOG.info("Registered new upstream %s", parsed.hostname)
             self._json(200, {"ok": True, "registered": True})
         except (ValueError, json.JSONDecodeError) as exc:
             self._json(400, {"ok": False, "error": str(exc)})
 
     def _health(self) -> None:
         target, updated = self.state.snapshot()
+        parsed = urlsplit(target) if target else None
         self._json(200, {
             "ok": True,
             "service": "goproxy",
             "upstream_registered": bool(target),
+            "upstream_host": parsed.hostname if parsed else None,
             "updated_at": updated or None,
         })
 
