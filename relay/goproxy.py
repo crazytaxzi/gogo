@@ -219,8 +219,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def _oauth_token(self) -> None:
         try:
-            form = self._read_form()
-            result = self.oauth.token(form)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError as exc:
+                raise OAuthError("invalid_request", "Invalid Content-Length") from exc
+            if length < 1 or length > 65536:
+                raise OAuthError("invalid_request", "Invalid request body length")
+            form = self.oauth.parse_form(self.rfile.read(length))
+            result = self.oauth.exchange_token(form)
             self._json(200, result)
         except OAuthError as exc:
             self._oauth_error(exc)
@@ -321,7 +327,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if is_mcp:
             supplied = self._bearer()
-            valid = self.oauth.validate_access_token(supplied, self.oauth.resource) if supplied else None
+            valid = self.oauth.validate_access_token(supplied, "gomcp") if supplied else None
             if not valid:
                 self._json(
                     401,
