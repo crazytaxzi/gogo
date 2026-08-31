@@ -12,19 +12,22 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Inspect target runner
-        shell: bash
+        shell: powershell
         run: |
-          set -euo pipefail
-          echo "runner_name=$RUNNER_NAME"
-          echo "runner_os=$RUNNER_OS"
-          echo "runner_arch=$RUNNER_ARCH"
-          echo "host=$(hostname)"
-          echo "user=$(whoami)"
-          uname -a
-          command -v python3 || true
-          python3 --version || true
-          command -v systemctl || true
-          command -v cloudflared || true
-          command -v curl || true
-          command -v openssl || true
-          sudo -n true && echo 'sudo_nopasswd=yes' || echo 'sudo_nopasswd=no'
+          $ErrorActionPreference = 'Stop'
+          Write-Host "runner_name=$env:RUNNER_NAME"
+          Write-Host "runner_os=$env:RUNNER_OS"
+          Write-Host "runner_arch=$env:RUNNER_ARCH"
+          Write-Host "host=$env:COMPUTERNAME"
+          Write-Host "user=$env:USERNAME"
+          Get-ComputerInfo | Select-Object WindowsProductName,WindowsVersion,OsArchitecture | Format-List
+          foreach ($cmd in @('python','py','pwsh','powershell','cloudflared','curl.exe','git','docker','node')) {
+            $c = Get-Command $cmd -ErrorAction SilentlyContinue
+            if ($c) { Write-Host "$cmd=$($c.Source)" } else { Write-Host "$cmd=missing" }
+          }
+          if (Get-Command python -ErrorAction SilentlyContinue) { python --version }
+          elseif (Get-Command py -ErrorAction SilentlyContinue) { py -3 --version }
+          $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          Write-Host "administrator=$admin"
+          Write-Host "home=$env:USERPROFILE"
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name,Root,Free,Used | Format-Table -AutoSize
