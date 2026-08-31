@@ -1,0 +1,41 @@
+name: Probe GoMCP hostname TLS
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/gomcp-hostname-probe.yml']
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify DNS TLS discovery and OAuth challenge
+        shell: bash
+        run: |
+          set -euo pipefail
+          host='gomcp-8-235-7-248.nip.io'
+          base="https://${host}"
+          getent ahostsv4 "$host" | grep -q '8.235.7.248'
+          health="$(curl --max-time 20 -fsS "$base/goproxy/health")"
+          prm="$(curl --max-time 20 -fsS "$base/.well-known/oauth-protected-resource/goproxy/mcp")"
+          meta="$(curl --max-time 20 -fsS "$base/.well-known/oauth-authorization-server/goproxy/oauth")"
+          python3 - "$base" "$health" "$prm" "$meta" <<'PY'
+          import json, sys
+          base, health_raw, prm_raw, meta_raw = sys.argv[1:]
+          health=json.loads(health_raw); prm=json.loads(prm_raw); meta=json.loads(meta_raw)
+          assert health['ok'] and health['oauth']
+          assert health['issuer']==base+'/goproxy/oauth'
+          assert prm['resource']==base+'/goproxy/mcp'
+          assert prm['authorization_servers']==[base+'/goproxy/oauth']
+          assert meta['issuer']==base+'/goproxy/oauth'
+          assert meta['registration_endpoint']==base+'/goproxy/oauth/register'
+          print('external_dns_tls_discovery=success')
+          PY
+          body='{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}'
+          code="$(curl --max-time 20 -sS -D /tmp/h -o /tmp/b -w '%{http_code}' -H 'Content-Type: application/json' --data "$body" "$base/goproxy/mcp")"
+          test "$code" = '401'
+          grep -qi 'www-authenticate:.*Bearer' /tmp/h
+          grep -qi 'resource_metadata=.*oauth-protected-resource' /tmp/h
+          echo | openssl s_client -connect "${host}:443" -servername "$host" -verify_return_error 2>/dev/null | openssl x509 -noout -checkhost "$host"
+          echo 'external_hostname_probe=PASS'
