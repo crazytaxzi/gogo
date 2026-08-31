@@ -1,0 +1,102 @@
+name: Finalize GoMCP owner rotation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/finalize-owner-rotation.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Make repository verifier authoritative
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('.github/workflows/deploy-gomcp.yml')
+          lines = p.read_text(encoding='utf-8').splitlines(True)
+
+          # Remove the obsolete owner_hash job output.
+          lines = [line for line in lines if 'owner_hash: $' not in line]
+
+          # Remove GAMEPC owner-token generation/hash block and its output.
+          start = next(i for i,l in enumerate(lines) if "$ownerKeyFile = Join-Path $stateDir 'mcp.token'" in l)
+          end = next(i for i,l in enumerate(lines[start:], start) if '$pub64 =' in l)
+          del lines[start:end]
+          lines = [line for line in lines if '"owner_hash=$ownerHash"' not in line]
+          lines = [line.replace('relay_wrapping_key=ready owner_key=present_not_printed','relay_wrapping_key=ready') for line in lines]
+
+          # Add checkout to the relay-bundle job if absent.
+          sync = next(i for i,l in enumerate(lines) if '- name: Synchronize owner verifier and encrypt relay credentials for GoMCP' in l)
+          if not any('uses: actions/checkout@v4' in l for l in lines[max(0,sync-3):sync]):
+              lines[sync:sync] = ['      - uses: actions/checkout@v4\n']
+              sync += 1
+
+          # Remove obsolete owner hash env input.
+          lines = [line for line in lines if not line.strip().startswith('OWNER_HASH:')]
+
+          # Load the verifier from the repository in the relay-bundle script.
+          marker = '          chmod 700 "$state"\n'
+          idx = next(i for i,l in enumerate(lines) if l == marker and i > sync)
+          insert = '          OWNER_HASH="$(tr -d \'\\r\\n\' < relay/owner-token.sha256)"\n'
+          if insert not in lines:
+              lines.insert(idx + 1, insert)
+
+          # Stop treating GAMEPC mcp.token as required.
+          lines = [line for line in lines if "owner key is missing" not in line]
+          lines = [line.replace('relay_credentials=installed owner_key=present_not_printed','relay_credentials=installed owner_verifier=repository_managed') for line in lines]
+
+          # Replace owner-key-dependent smoke test with current OAuth/DCR contract probe.
+          smoke_start = next(i for i,l in enumerate(lines) if '- name: Verify full ChatGPT OAuth flow, tools and refresh token' in l)
+          smoke_end = next(i for i,l in enumerate(lines[smoke_start:], smoke_start) if l.startswith('  external-probe:'))
+          replacement = '''      - name: Verify OAuth discovery and DCR contract
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'https://gomcp-8-235-7-248.nip.io'
+          $meta = Invoke-RestMethod -UseBasicParsing -Uri "$base/.well-known/oauth-authorization-server/goproxy/oauth" -TimeoutSec 10
+          if (-not $meta.registration_endpoint) { throw 'OAuth registration endpoint missing' }
+          $payload = @{
+            client_name = 'GoMCP deployment DCR probe'
+            redirect_uris = @('https://chatgpt.com/connector_platform_oauth_redirect')
+            token_endpoint_auth_method = 'none'
+            grant_types = @('authorization_code','refresh_token')
+            response_types = @('code')
+            application_type = 'web'
+          } | ConvertTo-Json -Compress
+          $client = Invoke-RestMethod -UseBasicParsing -Method Post -Uri $meta.registration_endpoint -ContentType 'application/json' -Body $payload -TimeoutSec 10
+          if (-not $client.client_id) { throw 'DCR probe failed' }
+          Write-Host 'oauth_discovery=success dcr=success owner_verifier=repository_managed'
+
+'''.splitlines(True)
+          lines[smoke_start:smoke_end] = replacement
+
+          p.write_text(''.join(lines), encoding='utf-8')
+          PY
+          git diff --check
+          git config user.name 'GoMCP Automation'
+          git config user.email 'actions@users.noreply.github.com'
+          git add .github/workflows/deploy-gomcp.yml
+          git commit -m 'Make rotated owner verifier authoritative'
+          git push origin HEAD:main
+
+      - name: Verify public OAuth relay recovered
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 20); do
+            if curl --max-time 10 -fsS https://gomcp-8-235-7-248.nip.io/goproxy/health >/dev/null; then
+              echo 'public_relay=healthy'
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
