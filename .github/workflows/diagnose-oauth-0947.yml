@@ -18,32 +18,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo '=== sanitized goproxy requests 16:45-16:50 UTC ==='
-          sudo journalctl -u goproxy.service --since '2026-08-31 16:45:00 UTC' --until '2026-08-31 16:50:30 UTC' --no-pager -o short-iso | \
-          python3 -c 'import re,sys
-for line in sys.stdin:
-    if "\"GET " not in line and "\"POST " not in line:
-        continue
-    line=re.sub(r"([A-Z]+) ([^ ?\"]+)\?[^ \" ]+", r"\1 \2?<redacted>", line)
-    line=re.sub(r"^(\S+\s+\S+\s+\S+\s+)(\S+)", r"\1<client>", line)
-    print(line.rstrip())'
+          echo '=== goproxy request statuses 16:45-16:51 UTC ==='
+          sudo journalctl -u goproxy.service --since '2026-08-31 16:45:00 UTC' --until '2026-08-31 16:51:00 UTC' --no-pager -o cat \
+            | grep -E '"(GET|POST) ' \
+            | sed -E 's#(GET|POST) ([^ ?"]+)\?[^ "]+#\1 \2?<redacted>#g; s#^[0-9a-fA-F:.]+ #-client- #g' \
+            || true
 
           echo '=== oauth state summary ==='
           python3 - <<'PY'
-          import json, pathlib, time
-          p=pathlib.Path.home()/'GoProxy/state/oauth.json'
-          d=json.loads(p.read_text())
-          now=time.time()
+          import json
+          import pathlib
+          import time
+          p = pathlib.Path.home() / 'GoProxy/state/oauth.json'
+          d = json.loads(p.read_text())
+          now = time.time()
           for key in ('clients','authorization_requests','codes','access_tokens','refresh_tokens'):
-              bucket=d.get(key,{})
-              print(f'{key}={len(bucket) if isinstance(bucket,dict) else "invalid"}')
-          reqs=d.get('authorization_requests',{})
-          for row in sorted((r for r in reqs.values() if isinstance(r,dict)), key=lambda r:r.get('created_at',0), reverse=True)[:3]:
-              print('auth_request age_sec=%d expires_in_sec=%d redirect=%s' % (max(0,int(now-float(row.get('created_at',now)))), int(float(row.get('expires_at',0))-now), row.get('redirect_uri','')))
-          codes=d.get('codes',{})
-          for row in sorted((r for r in codes.values() if isinstance(r,dict)), key=lambda r:r.get('expires_at',0), reverse=True)[:3]:
-              print('auth_code expires_in_sec=%d redirect=%s' % (int(float(row.get('expires_at',0))-now), row.get('redirect_uri','')))
+              bucket = d.get(key, {})
+              print('%s=%s' % (key, len(bucket) if isinstance(bucket, dict) else 'invalid'))
+          for row in sorted([r for r in d.get('authorization_requests', {}).values() if isinstance(r, dict)], key=lambda r: r.get('created_at', 0), reverse=True)[:5]:
+              print('auth_request age_sec=%d expires_in_sec=%d redirect=%s' % (max(0, int(now-float(row.get('created_at', now)))), int(float(row.get('expires_at', 0))-now), row.get('redirect_uri','')))
+          for row in sorted([r for r in d.get('codes', {}).values() if isinstance(r, dict)], key=lambda r: r.get('expires_at', 0), reverse=True)[:5]:
+              print('auth_code expires_in_sec=%d redirect=%s' % (int(float(row.get('expires_at', 0))-now), row.get('redirect_uri','')))
           PY
 
-          echo '=== service ==='
+          echo '=== current service ==='
           sudo systemctl is-active goproxy.service
