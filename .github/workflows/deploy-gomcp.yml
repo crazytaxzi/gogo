@@ -37,6 +37,7 @@ jobs:
           fs.writeFileSync(pub,kp.publicKey,'utf8');
           '@
             node -e $script $private $public
+            if ($LASTEXITCODE -ne 0) { throw 'RSA wrapping-key generation failed' }
           }
           $pub64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($public))
           "public_key=$pub64" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding ascii -Append
@@ -73,10 +74,30 @@ jobs:
   deploy:
     needs: wrap-relay-secret
     runs-on: [self-hosted, GoMCP]
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - name: Check out GoMCP source
         uses: actions/checkout@v4
+
+      - name: Stop prior GoMCP instance
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $install = 'C:\actions-runner\GoMCP'
+          $state = Join-Path $install 'state'
+          $pidFile = Join-Path $state 'supervisor.pid'
+          if (Test-Path $pidFile) {
+            try {
+              $oldPid = [int](Get-Content $pidFile -Raw).Trim()
+              if ($oldPid -gt 0) {
+                taskkill.exe /PID $oldPid /T /F 2>$null | Out-Null
+                Start-Sleep -Milliseconds 500
+              }
+            } catch {}
+            Remove-Item -Force $pidFile -ErrorAction SilentlyContinue
+          }
+          Remove-Item -Force (Join-Path $state 'tunnel.json') -ErrorAction SilentlyContinue
+          Write-Host 'prior_gomcp=stopped_or_absent'
 
       - name: Install GoMCP and cloudflared
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
@@ -93,13 +114,13 @@ jobs:
           Copy-Item -Force '.\mcp\supervisor.js' (Join-Path $install 'supervisor.js')
 
           node --check (Join-Path $install 'gomcp.js')
+          if ($LASTEXITCODE -ne 0) { throw 'gomcp.js syntax check failed' }
           node --check (Join-Path $install 'supervisor.js')
+          if ($LASTEXITCODE -ne 0) { throw 'supervisor.js syntax check failed' }
 
           $cloudflared = Join-Path $install 'cloudflared.exe'
           $download = Join-Path $install 'cloudflared.new.exe'
-          curl.exe -L --fail --silent --show-error --retry 3 \
-            'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' \
-            -o $download
+          curl.exe -L --fail --silent --show-error --retry 3 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -o $download
           if ($LASTEXITCODE -ne 0) { throw 'cloudflared download failed' }
           if ((Get-Item $download).Length -lt 10MB) { throw 'cloudflared download is unexpectedly small' }
           Move-Item -Force $download $cloudflared
@@ -115,34 +136,26 @@ jobs:
           const fs=require('fs'),crypto=require('crypto');
           const [priv,wrapped,out]=process.argv.slice(1);
           const secret=crypto.privateDecrypt({key:fs.readFileSync(priv),padding:crypto.constants.RSA_PKCS1_OAEP_PADDING,oaepHash:'sha256'},fs.readFileSync(wrapped));
-          fs.writeFileSync(out,secret,{encoding:null,mode:0o600});
+          fs.writeFileSync(out,secret,{mode:0o600});
           '@
           node -e $decrypt $private $wrappedFile $relaySecretFile
+          if ($LASTEXITCODE -ne 0) { throw 'relay credential decrypt failed' }
           Remove-Item -Force $wrappedFile
-          if ((Get-Item $relaySecretFile).Length -lt 20) { throw 'relay credential decrypt failed' }
+          if ((Get-Item $relaySecretFile).Length -lt 20) { throw 'relay credential is unexpectedly short' }
 
           $tokenFile = Join-Path $state 'mcp.token'
           if (-not (Test-Path $tokenFile) -or (Get-Item $tokenFile).Length -lt 32) {
             $tokenScript = "const fs=require('fs'),crypto=require('crypto');fs.writeFileSync(process.argv[1],crypto.randomBytes(48).toString('base64url')+'\\n',{mode:0o600});"
             node -e $tokenScript $tokenFile
+            if ($LASTEXITCODE -ne 0) { throw 'MCP token generation failed' }
           }
           Write-Host 'mcp_auth_token=present_not_printed'
 
-      - name: Restart detached GoMCP supervisor
+      - name: Start detached GoMCP supervisor
         shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
           $install = 'C:\actions-runner\GoMCP'
-          $state = Join-Path $install 'state'
-          $pidFile = Join-Path $state 'supervisor.pid'
-          if (Test-Path $pidFile) {
-            $oldPid = [int](Get-Content $pidFile -Raw).Trim()
-            if ($oldPid -gt 0) {
-              taskkill.exe /PID $oldPid /T /F 2>$null | Out-Null
-            }
-            Remove-Item -Force $pidFile -ErrorAction SilentlyContinue
-          }
-
           $node = (Get-Command node.exe -ErrorAction Stop).Source
           $env:RUNNER_TRACKING_ID = 'gomcp-daemon'
           $p = Start-Process -FilePath $node -ArgumentList @((Join-Path $install 'supervisor.js')) -WorkingDirectory $install -WindowStyle Hidden -PassThru
@@ -168,9 +181,17 @@ jobs:
           Write-Host 'local_gomcp=healthy tools=50'
 
           $tunnelFile = Join-Path $state 'tunnel.json'
-          for ($i=0; $i -lt 60 -and -not (Test-Path $tunnelFile); $i++) { Start-Sleep -Seconds 1 }
-          if (-not (Test-Path $tunnelFile)) { throw 'Quick Tunnel URL was not captured' }
-          $tunnel = Get-Content $tunnelFile -Raw | ConvertFrom-Json
+          $tunnel = $null
+          for ($i=0; $i -lt 90; $i++) {
+            if (Test-Path $tunnelFile) {
+              try {
+                $tunnel = Get-Content $tunnelFile -Raw | ConvertFrom-Json
+                if ($tunnel.url -match '^https://[a-z0-9-]+\.trycloudflare\.com$') { break }
+              } catch {}
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $tunnel -or -not $tunnel.url) { throw 'Quick Tunnel URL was not captured' }
           Write-Host "quick_tunnel=$($tunnel.url)"
 
           $relay = $null
@@ -185,12 +206,28 @@ jobs:
           Write-Host 'relay_upstream_registered=yes'
 
           $payload = '{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}'
-          $response = curl.exe --max-time 15 --silent --show-error --fail-with-body \
-            -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
-            --data $payload 'https://8.235.7.248/goproxy/mcp'
+          $response = curl.exe --max-time 15 --silent --show-error --fail-with-body -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data $payload 'https://8.235.7.248/goproxy/mcp'
           if ($LASTEXITCODE -ne 0) { throw 'public authenticated MCP ping failed' }
           $rpc = $response | ConvertFrom-Json
           if ($rpc.jsonrpc -ne '2.0' -or $rpc.id -ne 1 -or $null -eq $rpc.result) { throw 'unexpected MCP ping response' }
           Write-Host 'public_mcp_ping=success'
           Write-Host 'mcp_endpoint=https://8.235.7.248/goproxy/mcp'
           Write-Host "token_file=$state\mcp.token"
+
+  external-probe:
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Prove stable relay reaches authenticated GoMCP from outside GAMEPC
+        shell: bash
+        run: |
+          set -euo pipefail
+          body='{"jsonrpc":"2.0","id":99,"method":"ping","params":{}}'
+          code="$(curl --max-time 20 -sS -o /tmp/gomcp-response -w '%{http_code}' -H 'Content-Type: application/json' --data "$body" 'https://8.235.7.248/goproxy/mcp')"
+          cat /tmp/gomcp-response
+          echo
+          echo "status=$code"
+          test "$code" = '401'
+          grep -q 'unauthorized' /tmp/gomcp-response
+          echo 'external_end_to_end=success_auth_enforced=yes'
