@@ -42,7 +42,7 @@ a{color:#a7c7ff}main{width:min(1120px,calc(100% - 28px));margin:32px auto 70px}
 h1,h2,h3{margin-top:0}p{line-height:1.5;color:#cbd0d7}.muted{color:#9aa2ad;font-size:13px}
 label{display:block;font-weight:650;margin:14px 0 6px}input,textarea{width:100%;background:#101216;color:#fff;border:1px solid #454b55;border-radius:9px;padding:11px;font:inherit}
 input[type=checkbox]{width:auto;transform:scale(1.2);margin-right:8px}textarea{min-height:90px;resize:vertical}
-button,.button{border:0;border-radius:999px;padding:10px 16px;background:#f5f5f5;color:#111;font-weight:750;cursor:pointer;text-decoration:none;display:inline-block}
+button,.button,input[type=submit]{border:0;border-radius:999px;padding:10px 16px;background:#f5f5f5;color:#111;font-weight:750;cursor:pointer;text-decoration:none;display:inline-block;width:auto;-webkit-appearance:none;appearance:none;touch-action:manipulation}
 button.secondary,.button.secondary{background:#323741;color:#fff}.danger{background:#7f1d1d!important;color:#fff!important}
 .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.spread{justify-content:space-between}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
 .metric{padding:14px;background:#14161a;border:1px solid #2c3037;border-radius:10px}.metric strong{font-size:24px;display:block}
@@ -356,8 +356,10 @@ class Handler(BaseHTTPRequestHandler):
         content = f'''{self._nav(session)}<section class="card"><h1>Change password</h1>{required_html}{error_html}
 <form method="post" action="/goproxy/admin/password" autocomplete="off"><input type="hidden" name="csrf" value="{html.escape(str(session.get("csrf","")), quote=True)}">{request_html}
 <label for="current_password">Current password</label><input id="current_password" name="current_password" type="password" required autocomplete="current-password">
-<label for="new_password">New password</label><input id="new_password" name="new_password" type="password" minlength="{self.admin_auth.PASSWORD_MIN_CHARS}" required autocomplete="new-password">
-<label for="confirm_password">Confirm new password</label><input id="confirm_password" name="confirm_password" type="password" minlength="{self.admin_auth.PASSWORD_MIN_CHARS}" required autocomplete="new-password"><button type="submit">Change password</button></form>
+<label for="new_password">New password</label><input id="new_password" name="new_password" type="password" required autocomplete="new-password">
+<p class="muted">Minimum {self.admin_auth.PASSWORD_MIN_CHARS} characters.</p>
+<label for="confirm_password">Confirm new password</label><input id="confirm_password" name="confirm_password" type="password" required autocomplete="new-password">
+<input class="submit-button" type="submit" value="Change password"></form>
 <p class="muted">Changing the password signs out all existing GoMCP admin browser sessions. OAuth refresh tokens are left intact.</p></section>'''
         return self._page("GoMCP Password", content)
 
