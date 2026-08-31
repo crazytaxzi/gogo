@@ -15,6 +15,7 @@ const NODE = process.execPath;
 const SERVER = path.join(HOME, 'gomcp.js');
 const CLOUDFLARED = path.join(HOME, 'cloudflared.exe');
 const RELAY_SECRET_FILE = path.join(STATE, 'relay.secret');
+const UPSTREAM_SECRET_FILE = path.join(STATE, 'upstream.secret');
 const TUNNEL_STATE_FILE = path.join(STATE, 'tunnel.json');
 const PID_FILE = path.join(STATE, 'supervisor.pid');
 const RELAY_REGISTER = process.env.GOMCP_RELAY_REGISTER || 'https://8.235.7.248/goproxy/admin/register';
@@ -75,7 +76,7 @@ function postJson(url, token, payload, timeoutMs = 10000) {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
         'Content-Length': String(body.length),
-        'User-Agent': 'GoMCP-Supervisor/0.2',
+        'User-Agent': 'GoMCP-Supervisor/1.0',
       },
     }, res => {
       const chunks = [];
@@ -133,17 +134,26 @@ async function waitForServer() {
 
 function startServer() {
   if (server && processAlive(server.pid)) return;
-  log('starting GoMCP server');
+  if (!fs.existsSync(UPSTREAM_SECRET_FILE)) {
+    throw new Error(`upstream secret missing: ${UPSTREAM_SECRET_FILE}`);
+  }
+  log('starting GoMCP server with relay-only upstream authentication');
   server = spawn(NODE, [SERVER], {
     cwd: HOME, windowsHide: true,
-    env: { ...process.env, GOMCP_HOME: HOME },
+    env: {
+      ...process.env,
+      GOMCP_HOME: HOME,
+      GOMCP_TOKEN_FILE: UPSTREAM_SECRET_FILE,
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   pipeChild(server, 'server', 'server.log');
   server.on('exit', (code, signal) => {
     log(`server exited code=${code} signal=${signal}`);
     server = null;
-    if (!stopping) setTimeout(startServer, 2000).unref();
+    if (!stopping) setTimeout(() => {
+      try { startServer(); } catch (err) { log(`server restart failed: ${err.message}`); }
+    }, 2000).unref();
   });
 }
 
@@ -152,7 +162,7 @@ async function onTunnelUrl(url) {
   if (currentUrl !== url) {
     currentUrl = url;
     removePublishedTunnel();
-    log(`quick tunnel discovered url=${url}; waiting for relay DNS readiness`);
+    log(`quick tunnel discovered url=${url}; waiting for relay readiness`);
   }
   if (registeringUrl === url) return;
   registeringUrl = url;
@@ -230,7 +240,9 @@ async function main() {
   await startTunnel();
   setInterval(async () => {
     if (stopping) return;
-    if (!server || !processAlive(server.pid)) startServer();
+    if (!server || !processAlive(server.pid)) {
+      try { startServer(); } catch (err) { log(`watchdog server start failed: ${err.message}`); }
+    }
     if (!tunnel || !processAlive(tunnel.pid)) {
       try { await startTunnel(); } catch (err) { log(`watchdog tunnel start failed: ${err.message}`); }
     }
