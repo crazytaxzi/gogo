@@ -15,17 +15,22 @@ concurrency:
 jobs:
   deploy:
     runs-on: [self-hosted, linux, x64]
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Check out relay source
         uses: actions/checkout@v4
 
-      - name: Validate relay source
+      - name: Validate relay source and public DNS
         shell: bash
         run: |
           set -euo pipefail
           python3 -m py_compile relay/goproxy.py relay/oauth.py relay/gateway_patch.py
           bash -n relay/gateway_sync.sh relay/certbot_pre.sh relay/certbot_post.sh relay/cert_renew.sh
+          gomcp_host="$(tr -d '\r\n ' < relay/public_host.txt)"
+          test -n "$gomcp_host"
+          echo "gomcp_host=$gomcp_host"
+          getent ahostsv4 "$gomcp_host" | tee /tmp/gomcp-dns.txt
+          grep -q '8\.235\.7\.248' /tmp/gomcp-dns.txt
 
       - name: Install under ~/GoProxy
         shell: bash
@@ -36,6 +41,7 @@ jobs:
           chmod 700 "$install_dir/state"
           install -m 0755 relay/goproxy.py "$install_dir/goproxy.py"
           install -m 0644 relay/oauth.py "$install_dir/oauth.py"
+          install -m 0644 relay/public_host.txt "$install_dir/public_host.txt"
           install -m 0755 relay/gateway_patch.py "$install_dir/gateway_patch.py"
           install -m 0755 relay/gateway_sync.sh "$install_dir/gateway_sync.sh"
           install -m 0755 relay/certbot_pre.sh "$install_dir/certbot_pre.sh"
@@ -71,32 +77,55 @@ jobs:
           sudo systemctl restart goproxy.service
           sudo systemctl enable --now goproxy-cert-renew.timer
 
+      - name: Ensure dedicated GoMCP TLS certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          gomcp_host="$(tr -d '\r\n ' < "$HOME/GoProxy/public_host.txt")"
+          cert="/etc/letsencrypt/live/${gomcp_host}/fullchain.pem"
+          project=/home/crazytaxzi/Neon_Wreckers_TTV_Overlay
+          if ! sudo test -s "$cert"; then
+            echo "issuing_certificate_for=$gomcp_host"
+            cd "$project"
+            sudo docker compose stop gateway
+            restart_gateway() {
+              sudo docker compose up -d gateway >/dev/null 2>&1 || true
+            }
+            trap restart_gateway EXIT
+            sudo certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$gomcp_host"
+            sudo test -s "$cert"
+            restart_gateway
+            trap - EXIT
+          else
+            echo 'hostname_certificate=already_present'
+          fi
+          sudo openssl x509 -in "$cert" -noout -subject -issuer -dates -ext subjectAltName
+
       - name: Sync HTTPS gateway
         shell: bash
         run: |
           set -euo pipefail
           sudo "$HOME/GoProxy/gateway_sync.sh"
 
-      - name: Verify renewal hooks once
+      - name: Verify dedicated hostname certificate renewal
         shell: bash
         run: |
           set -euo pipefail
-          marker="$HOME/GoProxy/state/cert-renewal-verified"
-          project=/home/crazytaxzi/Neon_Wreckers_TTV_Overlay
-          public_host="$(sed -n 's/^PUBLIC_HOST=//p' "$project/.env" | tail -n1 | tr -d '\r\"')"
+          gomcp_host="$(tr -d '\r\n ' < "$HOME/GoProxy/public_host.txt")"
+          marker="$HOME/GoProxy/state/hostname-cert-renewal-verified"
           if [[ ! -f "$marker" ]]; then
-            sudo certbot renew --cert-name "$public_host" --dry-run
+            sudo certbot renew --cert-name "$gomcp_host" --dry-run
             touch "$marker"
           else
-            echo 'renewal_hook_test=already_verified'
+            echo 'hostname_renewal_hook_test=already_verified'
           fi
 
-      - name: Verify relay, OAuth discovery and renewal timer
+      - name: Verify hostname TLS OAuth discovery and relay
         shell: bash
         run: |
           set -euo pipefail
-          project=/home/crazytaxzi/Neon_Wreckers_TTV_Overlay
-          public_host="$(sed -n 's/^PUBLIC_HOST=//p' "$project/.env" | tail -n1 | tr -d '\r\"')"
+          gomcp_host="$(tr -d '\r\n ' < "$HOME/GoProxy/public_host.txt")"
+          origin="https://${gomcp_host}"
           sudo systemctl is-active --quiet goproxy.service
           sudo systemctl is-enabled --quiet goproxy.service
           sudo systemctl is-active --quiet goproxy-cert-renew.timer
@@ -104,42 +133,42 @@ jobs:
           test -s "$HOME/GoProxy/state/register.secret"
           test -s "$HOME/GoProxy/state/upstream.secret"
 
-          for i in {1..20}; do
+          for i in {1..30}; do
             if curl --max-time 3 -fsS http://127.0.0.1:8787/health >/dev/null 2>&1 && \
-               curl --max-time 5 -fsS "https://${public_host}/goproxy/health" >/dev/null 2>&1 && \
-               curl --max-time 5 -fsS "https://${public_host}/.well-known/oauth-protected-resource/goproxy/mcp" >/dev/null 2>&1 && \
-               curl --max-time 5 -fsS "https://${public_host}/.well-known/oauth-authorization-server/goproxy/oauth" >/dev/null 2>&1; then
+               curl --max-time 8 -fsS "${origin}/goproxy/health" >/dev/null 2>&1 && \
+               curl --max-time 8 -fsS "${origin}/.well-known/oauth-protected-resource/goproxy/mcp" >/dev/null 2>&1 && \
+               curl --max-time 8 -fsS "${origin}/.well-known/oauth-authorization-server/goproxy/oauth" >/dev/null 2>&1; then
               break
             fi
             sleep 1
           done
 
           local_health="$(curl --max-time 3 -fsS http://127.0.0.1:8787/health)"
-          public_health="$(curl --max-time 5 -fsS "https://${public_host}/goproxy/health")"
-          prm="$(curl --max-time 5 -fsS "https://${public_host}/.well-known/oauth-protected-resource/goproxy/mcp")"
-          asmeta="$(curl --max-time 5 -fsS "https://${public_host}/.well-known/oauth-authorization-server/goproxy/oauth")"
-          python3 - "$public_host" "$local_health" "$public_health" "$prm" "$asmeta" <<'PY'
+          public_health="$(curl --max-time 8 -fsS "${origin}/goproxy/health")"
+          prm="$(curl --max-time 8 -fsS "${origin}/.well-known/oauth-protected-resource/goproxy/mcp")"
+          asmeta="$(curl --max-time 8 -fsS "${origin}/.well-known/oauth-authorization-server/goproxy/oauth")"
+          python3 - "$origin" "$local_health" "$public_health" "$prm" "$asmeta" <<'PY'
           import json, sys
-          host, local_raw, public_raw, prm_raw, as_raw = sys.argv[1:]
+          origin, local_raw, public_raw, prm_raw, as_raw = sys.argv[1:]
           local = json.loads(local_raw)
           public = json.loads(public_raw)
           prm = json.loads(prm_raw)
           meta = json.loads(as_raw)
           assert local['ok'] and local['oauth']
           assert public['ok'] and public['oauth']
-          assert prm['resource'] == f'https://{host}/goproxy/mcp'
-          assert prm['authorization_servers'] == [f'https://{host}/goproxy/oauth']
-          assert meta['issuer'] == f'https://{host}/goproxy/oauth'
-          assert meta['registration_endpoint'] == f'https://{host}/goproxy/oauth/register'
+          assert public['issuer'] == f'{origin}/goproxy/oauth'
+          assert prm['resource'] == f'{origin}/goproxy/mcp'
+          assert prm['authorization_servers'] == [f'{origin}/goproxy/oauth']
+          assert meta['issuer'] == f'{origin}/goproxy/oauth'
+          assert meta['registration_endpoint'] == f'{origin}/goproxy/oauth/register'
           assert meta['token_endpoint_auth_methods_supported'] == ['none']
           assert 'refresh_token' in meta['grant_types_supported']
           assert 'S256' in meta['code_challenge_methods_supported']
-          print('oauth_discovery=success')
+          print('hostname_oauth_discovery=success')
           PY
 
-          sudo systemctl list-timers --all goproxy-cert-renew.timer --no-pager
-          sudo openssl x509 -in "/etc/letsencrypt/live/${public_host}/fullchain.pem" -noout -dates
-          echo "public_base=https://${public_host}/goproxy/"
-          echo "mcp_endpoint=https://${public_host}/goproxy/mcp"
-          echo "oauth_issuer=https://${public_host}/goproxy/oauth"
-          echo "oauth_registration=https://${public_host}/goproxy/oauth/register"
+          echo | openssl s_client -connect "${gomcp_host}:443" -servername "$gomcp_host" -verify_return_error 2>/dev/null | \
+            openssl x509 -noout -checkhost "$gomcp_host"
+          echo "mcp_endpoint=${origin}/goproxy/mcp"
+          echo "oauth_issuer=${origin}/goproxy/oauth"
+          echo "oauth_registration=${origin}/goproxy/oauth/register"
