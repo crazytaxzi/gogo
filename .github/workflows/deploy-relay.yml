@@ -1,0 +1,68 @@
+name: Deploy GoProxy relay
+
+on:
+  push:
+    branches: [relay-build]
+    paths:
+      - 'relay/**'
+      - '.github/workflows/deploy-relay.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Check out relay source
+        uses: actions/checkout@v4
+
+      - name: Validate relay source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile relay/goproxy.py
+
+      - name: Install under ~/GoProxy
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_dir="$HOME/GoProxy"
+          mkdir -p "$install_dir/state"
+          chmod 700 "$install_dir/state"
+          install -m 0755 relay/goproxy.py "$install_dir/goproxy.py"
+          install -m 0644 relay/goproxy.service "$install_dir/goproxy.service"
+
+          secret_file="$install_dir/state/register.secret"
+          if [[ ! -s "$secret_file" ]]; then
+            python3 - <<'PY' > "$secret_file"
+          import secrets
+          print(secrets.token_urlsafe(48))
+          PY
+            chmod 600 "$secret_file"
+          fi
+
+      - name: Install and start systemd service
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo install -m 0644 "$HOME/GoProxy/goproxy.service" /etc/systemd/system/goproxy.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now goproxy.service
+          sudo systemctl restart goproxy.service
+
+      - name: Verify service
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..20}; do
+            if curl -fsS http://127.0.0.1:8787/health; then
+              echo
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8787/health
+          echo
+          sudo systemctl --no-pager --full status goproxy.service
+          ss -ltn | grep '127.0.0.1:8787'
+          echo "install_dir=$HOME/GoProxy"
+          echo "registration_secret_file=$HOME/GoProxy/state/register.secret"
