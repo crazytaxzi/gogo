@@ -20,11 +20,10 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import re, textwrap
+          import re
           p = Path('relay/oauth.py')
           s = p.read_text(encoding='utf-8')
-          new = textwrap.dedent('''
-              @staticmethod
+          new = '''    @staticmethod
               def _validate_redirect_uri(uri: str) -> str:
                   parsed = urlsplit(uri)
                   host = (parsed.hostname or "").lower().rstrip(".")
@@ -48,7 +47,11 @@ jobs:
                       )
                   return urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, ""))
 
-          ''').lstrip('\n')
+          '''
+          # The YAML block removes the common indentation before Python executes;
+          # normalize only the extra 10 spaces carried by lines after the first.
+          lines = new.splitlines(True)
+          new = lines[0] + ''.join((line[10:] if line.startswith('          ') else line) for line in lines[1:])
           pattern = r'    @staticmethod\n    def _validate_redirect_uri\(uri: str\) -> str:\n.*?(?=    def register_client\()'
           s2, n = re.subn(pattern, new, s, count=1, flags=re.S)
           if n != 1:
