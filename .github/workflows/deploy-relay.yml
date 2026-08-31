@@ -51,6 +51,20 @@ jobs:
           sudo systemctl enable --now goproxy.service
           sudo systemctl restart goproxy.service
 
+      - name: Allow only Docker gateway to reach relay
+        shell: bash
+        run: |
+          set -euo pipefail
+          container=neon-wreckers-gateway-1
+          gateway_ip="$(sudo docker inspect "$container" --format '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}')"
+          network_name="$(sudo docker inspect "$container" --format '{{range $name, $cfg := .NetworkSettings.Networks}}{{$name}}{{end}}')"
+          subnet="$(sudo docker network inspect "$network_name" --format '{{(index .IPAM.Config 0).Subnet}}')"
+          bridge_if="$(ip -o -4 addr show | awk -v target="$gateway_ip" 'index($4,target"/")==1 {print $2; exit}')"
+          test -n "$gateway_ip"
+          test -n "$subnet"
+          test -n "$bridge_if"
+          sudo ufw allow in on "$bridge_if" proto tcp from "$subnet" to "$gateway_ip" port 8787 comment 'GoProxy Docker bridge'
+
       - name: Wire relay into HTTPS gateway
         shell: bash
         run: |
@@ -83,18 +97,18 @@ jobs:
           test -n "$public_host"
 
           for i in {1..20}; do
-            if curl -fsS http://127.0.0.1:8787/health >/dev/null 2>&1 && \
-               curl -fsS "https://${public_host}/goproxy/health" >/dev/null 2>&1; then
+            if curl --max-time 3 -fsS http://127.0.0.1:8787/health >/dev/null 2>&1 && \
+               curl --max-time 5 -fsS "https://${public_host}/goproxy/health" >/dev/null 2>&1; then
               break
             fi
             sleep 1
           done
 
           echo 'local:'
-          curl -fsS http://127.0.0.1:8787/health
+          curl --max-time 3 -fsS http://127.0.0.1:8787/health
           echo
           echo 'public:'
-          curl -fsS "https://${public_host}/goproxy/health"
+          curl --max-time 5 -fsS "https://${public_host}/goproxy/health"
           echo
           sudo systemctl --no-pager --full status goproxy.service
           echo "public_base=https://${public_host}/goproxy/"
