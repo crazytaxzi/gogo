@@ -24,7 +24,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile relay/goproxy.py relay/oauth.py relay/gateway_patch.py
+          python3 -m py_compile relay/goproxy.py relay/oauth.py relay/admin_auth.py relay/tool_policy.py relay/selftest.py relay/gateway_patch.py
+          python3 relay/selftest.py
           bash -n relay/gateway_sync.sh relay/certbot_pre.sh relay/certbot_post.sh relay/cert_renew.sh
           gomcp_host="$(tr -d '\r\n ' < relay/public_host.txt)"
           test -n "$gomcp_host"
@@ -41,6 +42,8 @@ jobs:
           chmod 700 "$install_dir/state"
           install -m 0755 relay/goproxy.py "$install_dir/goproxy.py"
           install -m 0644 relay/oauth.py "$install_dir/oauth.py"
+          install -m 0644 relay/admin_auth.py "$install_dir/admin_auth.py"
+          install -m 0644 relay/tool_policy.py "$install_dir/tool_policy.py"
           install -m 0644 relay/public_host.txt "$install_dir/public_host.txt"
           install -m 0755 relay/gateway_patch.py "$install_dir/gateway_patch.py"
           install -m 0755 relay/gateway_sync.sh "$install_dir/gateway_sync.sh"
@@ -50,6 +53,15 @@ jobs:
           install -m 0644 relay/goproxy.service "$install_dir/goproxy.service"
           install -m 0644 relay/goproxy-cert-renew.service "$install_dir/goproxy-cert-renew.service"
           install -m 0644 relay/goproxy-cert-renew.timer "$install_dir/goproxy-cert-renew.timer"
+
+          admin_credential="$install_dir/state/admin-credential.json"
+          if [[ ! -s "$admin_credential" ]]; then
+            install -m 0600 relay/admin-bootstrap.json "$admin_credential"
+            echo 'admin_credential=bootstrapped_change_required'
+          else
+            chmod 600 "$admin_credential"
+            echo 'admin_credential=preserved'
+          fi
 
           for name in register upstream; do
             secret_file="$install_dir/state/${name}.secret"
@@ -120,7 +132,7 @@ jobs:
             echo 'hostname_renewal_hook_test=already_verified'
           fi
 
-      - name: Verify hostname TLS OAuth discovery and relay
+      - name: Verify hostname TLS OAuth login and relay
         shell: bash
         run: |
           set -euo pipefail
@@ -132,10 +144,12 @@ jobs:
           sudo systemctl is-enabled --quiet goproxy-cert-renew.timer
           test -s "$HOME/GoProxy/state/register.secret"
           test -s "$HOME/GoProxy/state/upstream.secret"
+          test -s "$HOME/GoProxy/state/admin-credential.json"
 
           for i in {1..30}; do
             if curl --max-time 3 -fsS http://127.0.0.1:8787/health >/dev/null 2>&1 && \
                curl --max-time 8 -fsS "${origin}/goproxy/health" >/dev/null 2>&1 && \
+               curl --max-time 8 -fsS "${origin}/goproxy/login" >/dev/null 2>&1 && \
                curl --max-time 8 -fsS "${origin}/.well-known/oauth-protected-resource/goproxy/mcp" >/dev/null 2>&1 && \
                curl --max-time 8 -fsS "${origin}/.well-known/oauth-authorization-server/goproxy/oauth" >/dev/null 2>&1; then
               break
@@ -145,6 +159,7 @@ jobs:
 
           local_health="$(curl --max-time 3 -fsS http://127.0.0.1:8787/health)"
           public_health="$(curl --max-time 8 -fsS "${origin}/goproxy/health")"
+          login_page="$(curl --max-time 8 -fsS "${origin}/goproxy/login")"
           prm="$(curl --max-time 8 -fsS "${origin}/.well-known/oauth-protected-resource/goproxy/mcp")"
           asmeta="$(curl --max-time 8 -fsS "${origin}/.well-known/oauth-authorization-server/goproxy/oauth")"
           python3 - "$origin" "$local_health" "$public_health" "$prm" "$asmeta" <<'PY'
@@ -154,8 +169,8 @@ jobs:
           public = json.loads(public_raw)
           prm = json.loads(prm_raw)
           meta = json.loads(as_raw)
-          assert local['ok'] and local['oauth']
-          assert public['ok'] and public['oauth']
+          assert local['ok'] and local['oauth'] and local['admin_auth']
+          assert public['ok'] and public['oauth'] and public['admin_auth']
           assert public['issuer'] == f'{origin}/goproxy/oauth'
           assert prm['resource'] == f'{origin}/goproxy/mcp'
           assert prm['authorization_servers'] == [f'{origin}/goproxy/oauth']
@@ -164,11 +179,14 @@ jobs:
           assert meta['token_endpoint_auth_methods_supported'] == ['none']
           assert 'refresh_token' in meta['grant_types_supported']
           assert 'S256' in meta['code_challenge_methods_supported']
-          print('hostname_oauth_discovery=success')
+          print('hostname_oauth_admin_discovery=success')
           PY
+          grep -q 'GoMCP Admin Login' <<< "$login_page"
 
           echo | openssl s_client -connect "${gomcp_host}:443" -servername "$gomcp_host" -verify_return_error 2>/dev/null | \
             openssl x509 -noout -checkhost "$gomcp_host"
           echo "mcp_endpoint=${origin}/goproxy/mcp"
+          echo "admin_login=${origin}/goproxy/login"
+          echo "admin_console=${origin}/goproxy/admin"
           echo "oauth_issuer=${origin}/goproxy/oauth"
           echo "oauth_registration=${origin}/goproxy/oauth/register"
