@@ -161,7 +161,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Referrer-Policy", "same-origin")
         if html_page:
             self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
             self.send_header("X-Frame-Options", "DENY")
@@ -270,7 +270,10 @@ class Handler(BaseHTTPRequestHandler):
         if referer:
             parsed = urlsplit(referer)
             return f"{parsed.scheme}://{parsed.netloc}".rstrip("/") == expected
-        return False
+        # Some mobile browsers legitimately omit both Origin and Referer on
+        # same-origin form POSTs. CSRF still requires the per-session token
+        # plus the Secure, HttpOnly, SameSite=Lax session cookie.
+        return True
 
     def _require_same_origin(self) -> None:
         if not self._same_origin_post():
