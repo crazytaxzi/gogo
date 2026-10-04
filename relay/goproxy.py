@@ -528,6 +528,22 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, json.JSONDecodeError) as exc:
             self._json(400, {"ok": False, "error": str(exc)})
 
+    def _admin_password_reset(self) -> None:
+        if not self.state.authorized(self._bearer()):
+            self._json(401, {"ok": False, "error": "unauthorized"})
+            return
+        try:
+            payload = self._read_json()
+            new_password = str(payload.get("new_password", ""))
+            must_change = bool(payload.get("must_change_password", True))
+            self.admin_auth.reset_password(new_password, must_change_password=must_change)
+            self.admin_auth.destroy_all_sessions()
+            self._json(200, {"ok": True, "reset": True, "must_change_password": must_change})
+        except (OAuthError, AdminAuthError) as exc:
+            status = exc.status if isinstance(exc, OAuthError) else 400
+            message = exc.description if isinstance(exc, OAuthError) else str(exc)
+            self._json(status, {"ok": False, "error": message})
+
     def _health(self) -> None:
         target, updated = self.state.snapshot()
         parsed = urlsplit(target) if target else None
@@ -812,6 +828,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/admin/register":
             self._register()
+        elif path == "/admin/reset-password":
+            self._admin_password_reset()
         elif path == "/oauth/register":
             self._oauth_register()
         elif path == "/oauth/authorize":
