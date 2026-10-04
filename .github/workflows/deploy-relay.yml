@@ -96,6 +96,15 @@ jobs:
           print("admin_password_reset=success must_change_password=true")
           PY
 
+      - name: Apply one-time GoProxy admin reset record
+        if: ${{ hashFiles('relay/admin-reset-record.json') != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 0600 relay/admin-reset-record.json "$HOME/GoProxy/state/admin-credential.json"
+          rm -f "$HOME/GoProxy/state/admin-sessions.json"
+          echo 'admin_password_reset=success must_change_password=true'
+
       - name: Install services and Certbot hooks
         shell: bash
         run: |
