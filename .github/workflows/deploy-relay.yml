@@ -74,6 +74,28 @@ jobs:
             fi
           done
 
+      - name: Reset GoProxy admin password when requested
+        if: ${{ secrets.GOPROXY_ADMIN_RESET_PASSWORD != '' }}
+        shell: bash
+        env:
+          GOPROXY_ADMIN_RESET_PASSWORD: ${{ secrets.GOPROXY_ADMIN_RESET_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cd "$HOME/GoProxy"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          from admin_auth import AdminAuth
+
+          auth = AdminAuth(
+              Path.home() / "GoProxy/state/admin-credential.json",
+              Path.home() / "GoProxy/state/admin-sessions.json",
+          )
+          auth.reset_password(os.environ["GOPROXY_ADMIN_RESET_PASSWORD"], must_change_password=True)
+          auth.destroy_all_sessions()
+          print("admin_password_reset=success must_change_password=true")
+          PY
+
       - name: Install services and Certbot hooks
         shell: bash
         run: |
