@@ -260,6 +260,16 @@ class AdminAuth:
     def csrf_valid(session: dict[str, Any] | None, supplied: str) -> bool:
         return bool(session and supplied) and hmac.compare_digest(str(session.get("csrf", "")), supplied)
 
+    def reset_password(self, new_password: str, must_change_password: bool = True) -> None:
+        credential = self._load_credential()
+        self.validate_new_password(new_password)
+        credential["password"] = self.make_password_record(new_password)
+        credential["must_change_password"] = bool(must_change_password)
+        credential["updated_at"] = int(time.time())
+        _atomic_json(self.credential_file, credential)
+        with self.lock:
+            self._failures.clear()
+
     def change_password(self, username: str, current_password: str, new_password: str) -> None:
         credential = self._load_credential()
         username_ok = hmac.compare_digest(
