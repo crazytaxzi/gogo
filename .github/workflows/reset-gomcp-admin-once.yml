@@ -1,0 +1,79 @@
+name: One-time GoMCP admin reset
+
+on:
+  push:
+    paths:
+      - '.github/workflows/reset-gomcp-admin-once.yml'
+
+jobs:
+  reset:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Reset GoProxy admin password and encrypt result
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/gomcp-admin-reset"
+          mkdir -p "$out"
+
+          python3 - <<'PY'
+          import os
+          import secrets
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path.cwd() / "relay"))
+          from admin_auth import AdminAuth
+
+          state = Path.home() / "GoProxy" / "state"
+          auth = AdminAuth(
+              state / "admin-credential.json",
+              state / "admin-sessions.json",
+          )
+
+          alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%_-"
+          password = "".join(secrets.choice(alphabet) for _ in range(24))
+
+          auth.reset_password(password, must_change_password=False)
+          auth.destroy_all_sessions()
+
+          out = Path(os.environ["RUNNER_TEMP"]) / "gomcp-admin-reset"
+          (out / "password.txt").write_text(password, encoding="utf-8")
+          print("gomcp_admin_password_reset=success")
+          PY
+
+          cat > "$out/gamepc-public.pem" <<'PEM'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAzk82w2rCD11+TQveKvkD
+          KP/+kIPwOLJqzbK0y5dCGcqlYDDNjJw6nFmERy6xWMK8IjP4rcnyRry/ILoGvak5
+          t7A1fZ4BJ6NAx8O6V1D0H/n4klEVf7pq/55MPGcAgaByoQKXmqJ995O7cxm3QCdH
+          WuOsOiBDtr0jQQvaEXQtxeq6WdW/5XMkOWIBy3DeukkpADjiKT4SPoEz/8CglY2B
+          PbBDe4PBB5oP2HcPbuzm7Vxy0nt7Gnkpe7IRf9cOV2DD1w6TBVPlTrSvVRnCDAfk
+          LinVrPMipq0YAbK+YhtHMv6rjWzQwyeZkJugFF6wQjEtgdcOd3pLcY/C7lPzjZ62
+          n7FeHcv98zQxCJ2lpIdppHN80DGLYi8aLsVBpZHcX6hjDDLvh93sNm3mnw+JWidy
+          DYq8toHS0tpyXPTCQGOYhLSSxxMXIQ3ZylV2KCA8Mx1U/TENuASQyRBMBWpZLo7/
+          gloWJxExRuls7wO+D/iD2Lzo1Z7hZRPMspggE+kKWrYtAgMBAAE=
+          -----END PUBLIC KEY-----
+          PEM
+
+          openssl pkeyutl -encrypt \
+            -pubin \
+            -inkey "$out/gamepc-public.pem" \
+            -in "$out/password.txt" \
+            -out "$out/password.enc" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+
+          rm -f "$out/password.txt" "$out/gamepc-public.pem"
+
+      - name: Upload encrypted reset credential
+        uses: actions/upload-artifact@v4
+        with:
+          name: gomcp-admin-reset-encrypted
+          path: ${{ runner.temp }}/gomcp-admin-reset/password.enc
+          if-no-files-found: error
+          retention-days: 1
