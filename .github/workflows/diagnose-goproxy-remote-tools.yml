@@ -1,0 +1,22 @@
+name: Diagnose GoProxy remote tools
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 5
+    steps:
+      - name: Check remote tool policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$HOME/GoProxy"
+          python3 - <<'PY'
+          from pathlib import Path
+          from tool_policy import ToolPolicy
+          p = ToolPolicy(Path.home() / "GoProxy" / "state" / "tool-policy.json")
+          for name in ("remote.targets","remote.health","remote.list_tools","remote.call"):
+              print(name, p.settings_for(name))
+          PY
