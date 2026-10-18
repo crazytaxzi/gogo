@@ -1,0 +1,6 @@
+GoMCP rebuilt validation: PASS
+source_sha=7d0dc36967b117c021a82c6b3cea6ddcf594a39a
+runner=windows-latest
+node=22
+validated_utc=2026-10-18T16:39:45.9908297Z
+checks=node syntax; startup; health; 56 tools; OAuth DCR; PKCE S256; token exchange; authenticated tools/list
