@@ -25,6 +25,7 @@ $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $Stage = Join-Path $env:TEMP ('GoMCP-install-' + $Stamp)
 $ValidationMarkerUrl = 'https://raw.githubusercontent.com/crazytaxzi/gogo/main/ci/gomcp-rebuilt-validated.txt'
 $ValidatedSha = $null
+$RepoRoot = $null
 $RepoBase = $null
 $FailureFile = Join-Path $Desktop 'GoMCP-INSTALL-FAILED.txt'
 $OwnerFile = Join-Path $Desktop 'GoMCP-OWNER-KEY.txt'
@@ -82,7 +83,8 @@ try {
     $ValidationMatch = [regex]::Match($ValidationMarker, 'source_sha=([0-9a-f]{40})')
     if (-not $ValidationMatch.Success) { throw 'GitHub has no valid CI-approved GoMCP revision marker.' }
     $ValidatedSha = $ValidationMatch.Groups[1].Value
-    $RepoBase = 'https://raw.githubusercontent.com/crazytaxzi/gogo/' + $ValidatedSha + '/mcp/rebuilt'
+    $RepoRoot = 'https://raw.githubusercontent.com/crazytaxzi/gogo/' + $ValidatedSha
+    $RepoBase = $RepoRoot + '/mcp/rebuilt'
     Write-Host ('Validated revision: ' + $ValidatedSha)
 
     New-Item -ItemType Directory -Force -Path $Stage | Out-Null
@@ -160,8 +162,20 @@ try {
     Write-Host ('Local GoMCP healthy: ' + $health.toolCount + ' tools') -ForegroundColor Green
 
     Write-Host '[8/8] Verifying public Cloudflare route...'
-    $public = Wait-Public 45
-    if (-not $public) { throw 'Local GoMCP is healthy, but gamepc-mcp.sentionce.net did not recover through the existing tunnel.' }
+    $public = Wait-Public 20
+    if (-not $public) {
+        Write-Host 'Public route is returning an origin error. Running the CI-validated tunnel repair...' -ForegroundColor Yellow
+        $TunnelRepair = Join-Path $Stage 'Repair-GoMCP-Tunnel.ps1'
+        Invoke-WebRequest -UseBasicParsing -Uri ($RepoRoot + '/install/Repair-GoMCP-Tunnel.ps1') -OutFile $TunnelRepair -TimeoutSec 60
+        $tokens = $null
+        $parseErrors = $null
+        [System.Management.Automation.Language.Parser]::ParseFile($TunnelRepair,[ref]$tokens,[ref]$parseErrors) | Out-Null
+        if ($parseErrors.Count -gt 0) { throw 'Downloaded tunnel repair script failed PowerShell syntax validation.' }
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $TunnelRepair -NoPause
+        if ($LASTEXITCODE -ne 0) { throw 'Local GoMCP is healthy, but automatic Cloudflare tunnel repair failed. See GoMCP-TUNNEL-REPAIR-FAILED.txt on the Desktop.' }
+        $public = Wait-Public 30
+    }
+    if (-not $public) { throw 'Local GoMCP is healthy, but gamepc-mcp.sentionce.net is still unavailable after tunnel repair.' }
     Write-Host 'Public GoMCP metadata is reachable.' -ForegroundColor Green
 
     $OwnerKeyPath = Join-Path $State 'owner.key'
