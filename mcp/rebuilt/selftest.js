@@ -82,7 +82,7 @@ async function main() {
       response_types:['code'],
     }),
   });
-  assert(regResp.status === 201, 'DCR failed HTTP ' + regResp.status + ': ' + await regResp.text());
+  if (regResp.status !== 201) throw new Error('DCR failed HTTP ' + regResp.status + ': ' + await regResp.text());
   const client = await regResp.json();
   assert(client.client_id, 'DCR returned no client_id');
 
@@ -114,7 +114,7 @@ async function main() {
     headers:{ 'content-type':'application/x-www-form-urlencoded' },
     body:approve.toString(),
   });
-  assert(approved.status === 302, 'Authorize POST failed HTTP ' + approved.status + ': ' + await approved.text());
+  if (approved.status !== 302) throw new Error('Authorize POST failed HTTP ' + approved.status + ': ' + await approved.text());
   const location = approved.headers.get('location');
   assert(location, 'Authorize POST returned no redirect');
   const redirect = new URL(location);
@@ -134,7 +134,7 @@ async function main() {
     headers:{ 'content-type':'application/x-www-form-urlencoded' },
     body:tokenBody.toString(),
   });
-  assert(tokenResp.ok, 'Token exchange failed HTTP ' + tokenResp.status + ': ' + await tokenResp.text());
+  if (!tokenResp.ok) throw new Error('Token exchange failed HTTP ' + tokenResp.status + ': ' + await tokenResp.text());
   const tokens = await tokenResp.json();
   assert(tokens.access_token && tokens.refresh_token, 'Token response incomplete');
 
@@ -148,7 +148,7 @@ async function main() {
     },
     body:JSON.stringify({ jsonrpc:'2.0', id:1, method:'tools/list', params:{} }),
   });
-  assert(rpcResp.ok, 'Authenticated MCP call failed HTTP ' + rpcResp.status + ': ' + await rpcResp.text());
+  if (!rpcResp.ok) throw new Error('Authenticated MCP call failed HTTP ' + rpcResp.status + ': ' + await rpcResp.text());
   const rpc = await rpcResp.json();
   assert(rpc.result && Array.isArray(rpc.result.tools), 'tools/list returned no tools');
   assert(rpc.result.tools.length === 56, 'Authenticated tools/list expected 56, got ' + rpc.result.tools.length);
