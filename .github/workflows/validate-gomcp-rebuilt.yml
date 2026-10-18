@@ -11,7 +11,9 @@ on:
       - 'mcp/rebuilt/supervisor.js'
       - 'mcp/rebuilt/selftest.js'
       - 'install/Install-GoMCP.ps1'
+      - 'install/Repair-GoMCP-Tunnel.ps1'
       - 'dist/GoMCP-OneClick.cmd'
+      - 'dist/GoMCP-Tunnel-Repair.cmd'
       - '.github/workflows/validate-gomcp-rebuilt.yml'
   workflow_dispatch:
 
@@ -41,6 +43,10 @@ jobs:
           $tokens = $null
           $errors = $null
           [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'install/Install-GoMCP.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Error; exit 1 }
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'install/Repair-GoMCP-Tunnel.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
           if ($errors.Count -gt 0) { $errors | Format-List | Out-String | Write-Error; exit 1 }
       - name: Full OAuth and MCP smoke test
         shell: pwsh
