@@ -74,13 +74,45 @@ function Find-OriginCert {
     return $null
 }
 
+function Invoke-Cloudflared {
+    param(
+        [Parameter(Mandatory=$true)][string]$Exe,
+        [Parameter(Mandatory=$true)][string[]]$Args
+    )
+    $oldPref = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $Exe
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+        foreach ($a in $Args) { [void]$psi.ArgumentList.Add($a) }
+        $p = New-Object System.Diagnostics.Process
+        $p.StartInfo = $psi
+        [void]$p.Start()
+        $stdout = $p.StandardOutput.ReadToEnd()
+        $stderr = $p.StandardError.ReadToEnd()
+        $p.WaitForExit()
+        return [pscustomobject]@{
+            ExitCode = $p.ExitCode
+            StdOut = $stdout
+            StdErr = $stderr
+            Combined = (($stdout + [Environment]::NewLine + $stderr).Trim())
+        }
+    } finally {
+        $ErrorActionPreference = $oldPref
+    }
+}
 function Get-TunnelList([string]$Cloudflared,[string]$Cert) {
     $old = $env:TUNNEL_ORIGIN_CERT
     try {
         if ($Cert) { $env:TUNNEL_ORIGIN_CERT = $Cert }
-        $raw = & $Cloudflared tunnel list --output json 2>&1
-        if ($LASTEXITCODE -ne 0) { return $null }
-        $text = ($raw -join [Environment]::NewLine)
+        $r = Invoke-Cloudflared -Exe $Cloudflared -Args @('tunnel','list','--output','json')
+        if ($r.ExitCode -ne 0) { return $null }
+        $text = [string]$r.StdOut
+        if (-not $text.Trim()) { return $null }
         return @($text | ConvertFrom-Json)
     } catch { return $null }
     finally {
@@ -139,11 +171,12 @@ function Write-TunnelConfig([string]$TunnelId,[string]$CredentialFile) {
 }
 
 function Validate-Config([string]$Cloudflared) {
-    $out = & $Cloudflared tunnel --config $Config ingress validate 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        $out = & $Cloudflared --config $Config tunnel ingress validate 2>&1
+    $r = Invoke-Cloudflared -Exe $Cloudflared -Args @('tunnel','--config',$Config,'ingress','validate')
+    if ($r.ExitCode -ne 0) {
+        $r = Invoke-Cloudflared -Exe $Cloudflared -Args @('--config',$Config,'tunnel','ingress','validate')
     }
-    if ($LASTEXITCODE -ne 0) { throw ('cloudflared rejected the reconstructed config: ' + ($out -join ' ')) }
+    if ($r.ExitCode -ne 0) { throw ('cloudflared rejected the reconstructed config: ' + $r.Combined) }
+    if ($r.StdErr) { Write-Host $r.StdErr.Trim() -ForegroundColor DarkYellow }
 }
 
 function Start-TunnelReplica([string]$Cloudflared,[string]$TunnelId) {
@@ -174,8 +207,9 @@ function Create-ReplacementTunnel([string]$Cloudflared,[string]$Cert) {
         $env:TUNNEL_ORIGIN_CERT = $Cert
         $name = 'gamepc-mcp-recovery-' + $Stamp
         Write-Host ('Creating replacement Cloudflare tunnel: ' + $name) -ForegroundColor Yellow
-        $create = & $Cloudflared tunnel create $name 2>&1
-        if ($LASTEXITCODE -ne 0) { throw ('Tunnel creation failed: ' + ($create -join ' ')) }
+        $create = Invoke-Cloudflared -Exe $Cloudflared -Args @('tunnel','create',$name)
+        if ($create.ExitCode -ne 0) { throw ('Tunnel creation failed: ' + $create.Combined) }
+        if ($create.StdErr) { Write-Host $create.StdErr.Trim() -ForegroundColor DarkYellow }
 
         $list = Get-TunnelList $Cloudflared $Cert
         $new = @($list | Where-Object { [string]$_.name -eq $name } | Sort-Object createdAt -Descending | Select-Object -First 1)
@@ -189,11 +223,12 @@ function Create-ReplacementTunnel([string]$Cloudflared,[string]$Cert) {
         $replica = Start-TunnelReplica $Cloudflared $id
 
         Write-Host ('Repointing only ' + $PublicHost + ' to replacement tunnel ' + $id + ' ...')
-        $route = & $Cloudflared tunnel route dns --overwrite-dns $id $PublicHost 2>&1
-        if ($LASTEXITCODE -ne 0) {
+        $route = Invoke-Cloudflared -Exe $Cloudflared -Args @('tunnel','route','dns','--overwrite-dns',$id,$PublicHost)
+        if ($route.ExitCode -ne 0) {
             try { Stop-Process -Id $replica.Id -Force -ErrorAction SilentlyContinue } catch {}
-            throw ('DNS route update failed: ' + ($route -join ' '))
+            throw ('DNS route update failed: ' + $route.Combined)
         }
+        if ($route.StdErr) { Write-Host $route.StdErr.Trim() -ForegroundColor DarkYellow }
 
         return [pscustomobject]@{ Id=$id; Name=$name; Credential=$cred; Process=$replica; Recreated=$true }
     } finally {
