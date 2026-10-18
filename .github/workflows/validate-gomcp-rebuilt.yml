@@ -1,0 +1,34 @@
+name: Validate rebuilt GoMCP
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mcp/rebuilt/**'
+      - '.github/workflows/validate-gomcp-rebuilt.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Syntax checks
+        shell: pwsh
+        run: |
+          node --check mcp/rebuilt/gomcp.js
+          node --check mcp/rebuilt/oauth.js
+          node --check mcp/rebuilt/drive.js
+          node --check mcp/rebuilt/remote.js
+          node --check mcp/rebuilt/supervisor.js
+          node --check mcp/rebuilt/selftest.js
+      - name: Full OAuth and MCP smoke test
+        shell: pwsh
+        run: node mcp/rebuilt/selftest.js
