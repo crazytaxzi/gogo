@@ -14,7 +14,7 @@ const { createOAuth } = require('./oauth');
 const { createDrive } = require('./drive');
 const { createRemote } = require('./remote');
 
-const VERSION = '0.4.0-rebuilt';
+const VERSION = '0.4.1-recycle-safe';
 const PROTOCOL_CURRENT = '2026-07-28';
 const PROTOCOL_LEGACY_CURRENT = '2025-11-25';
 const PROTOCOL_LEGACY = new Set(['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25']);
@@ -113,6 +113,61 @@ function powershell(script, opts = {}) {
   return run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], opts);
 }
 
+const PERMANENT_DELETE_PATTERNS = [
+  [/\bRemove-Item\b/i, 'PowerShell Remove-Item'],
+  [/(^|[;&|()\s])(?:del|erase|rd|rmdir|rm|ri)\b/i, 'shell delete command'],
+  [/\b(?:fs\.)?(?:rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync)\s*\(/i, 'filesystem delete API'],
+  [/\b(?:rimraf|shutil\.rmtree|os\.(?:remove|unlink|rmdir))\b/i, 'filesystem delete API'],
+  [/\bSystem\.IO\.(?:File|Directory)\]?\s*::\s*Delete\b/i, '.NET delete API'],
+  [/\bgit\s+clean\b/i, 'git clean'],
+  [/\brobocopy\b[^\r\n]*(?:\/MIR|\/PURGE)\b/i, 'robocopy destructive mirror/purge'],
+  [/\bdocker\s+(?:rm|rmi|system\s+prune|image\s+prune|volume\s+prune|container\s+prune)\b/i, 'Docker destructive cleanup'],
+  [/\b(?:format|diskpart)\b/i, 'destructive disk command'],
+];
+
+function permanentDeleteReason(command) {
+  const text = String(command || '');
+  for (const [pattern, reason] of PERMANENT_DELETE_PATTERNS) {
+    if (pattern.test(text)) return reason;
+  }
+  return null;
+}
+
+function assertNoPermanentDeleteCommand(command, context = 'command') {
+  const reason = permanentDeleteReason(command);
+  if (reason) throw new Error('PERMANENT_DELETE_BLOCKED: ' + context + ' contains ' + reason + '. GoGoMCP policy requires files/directories to be moved to the Windows Recycle Bin instead.');
+}
+
+function isDeleteLikeRemoteTool(name) {
+  const n = String(name || '').toLowerCase();
+  if (n.includes('recycle') || n.includes('trash')) return false;
+  return /(^|[._-])(delete|remove|unlink|rmdir|rm)($|[._-])/.test(n);
+}
+
+function recyclePath(target, opts = {}) {
+  const p = normalizePath(target);
+  if (!fs.existsSync(p)) {
+    if (opts.force) return { ok: true, path: p, recycled: false, missing: true };
+    throw new Error('Path not found: ' + p);
+  }
+  const root = path.parse(p).root;
+  if (p.toLowerCase() === root.toLowerCase()) throw new Error('RECYCLE_BLOCKED: refusing to move a drive root to the Recycle Bin: ' + p);
+
+  const ps = [
+    'Add-Type -AssemblyName Microsoft.VisualBasic',
+    '$p = ' + JSON.stringify(p),
+    '$attr = [System.IO.File]::GetAttributes($p)',
+    'if (($attr -band [System.IO.FileAttributes]::Directory) -ne 0) {',
+    '  [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p,[Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)',
+    '} else {',
+    '  [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p,[Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)',
+    '}'
+  ].join('\n');
+  const r = powershell(ps, { timeoutMs: 120000 });
+  if (!r.ok) throw new Error('Recycle Bin operation failed for ' + p + ': ' + (r.stderr || r.stdout || ('exit ' + r.exitCode)));
+  return { ok: true, path: p, recycled: true };
+}
+
 function commandExists(name) {
   const r = powershell(`$c=Get-Command ${JSON.stringify(name)} -ErrorAction SilentlyContinue; if($c){$c.Source}`);
   return r.ok ? r.stdout.trim() : '';
@@ -153,18 +208,18 @@ const TOOLS = [
   { name: 'process.stop', description: 'Stop a process by PID.', inputSchema: inputSchema({ pid: S.integer('Process ID', 1), force: S.boolean('Force termination') }, ['pid']) },
   { name: 'process.tree', description: 'Return process parent/child relationships.', inputSchema: inputSchema({ pid: S.integer('Optional root PID', 0) }) },
 
-  { name: 'shell.run', description: 'Run a PowerShell or cmd command with timeout and capture output.', inputSchema: inputSchema({ command: S.string('Command text'), shell: { type: 'string', enum: ['powershell', 'cmd'] }, cwd: S.string('Optional working directory'), timeoutSeconds: S.integer('Timeout seconds', 1, 300) }, ['command']) },
+  { name: 'shell.run', description: 'Run a PowerShell or cmd command with timeout and capture output. Permanent filesystem deletion commands are blocked; use file.delete to send items to the Windows Recycle Bin.', inputSchema: inputSchema({ command: S.string('Command text'), shell: { type: 'string', enum: ['powershell', 'cmd'] }, cwd: S.string('Optional working directory'), timeoutSeconds: S.integer('Timeout seconds', 1, 300) }, ['command']) },
   { name: 'shell.which', description: 'Resolve an executable or command name using Windows command discovery.', inputSchema: inputSchema({ name: S.string('Command name') }, ['name']) },
 
   { name: 'file.read', description: 'Read a UTF-8 text file or return base64 for binary data.', inputSchema: inputSchema({ path: S.string('File path'), encoding: { type: 'string', enum: ['utf8', 'base64'] }, maxBytes: S.integer('Maximum bytes', 1, 16777216) }, ['path']) },
-  { name: 'file.write', description: 'Replace a file with UTF-8 or base64-decoded content.', inputSchema: inputSchema({ path: S.string('File path'), content: S.string('Content'), encoding: { type: 'string', enum: ['utf8', 'base64'] }, createParents: S.boolean('Create parent directories') }, ['path', 'content']) },
+  { name: 'file.write', description: 'Replace a file with UTF-8 or base64-decoded content. If the destination exists, the prior file is moved to the Windows Recycle Bin first.', inputSchema: inputSchema({ path: S.string('File path'), content: S.string('Content'), encoding: { type: 'string', enum: ['utf8', 'base64'] }, createParents: S.boolean('Create parent directories') }, ['path', 'content']) },
   { name: 'file.append', description: 'Append UTF-8 text to a file.', inputSchema: inputSchema({ path: S.string('File path'), content: S.string('Text to append'), createParents: S.boolean('Create parent directories') }, ['path', 'content']) },
   { name: 'file.list', description: 'List directory entries.', inputSchema: inputSchema({ path: S.string('Directory path'), recursive: S.boolean('Recurse'), maxEntries: S.integer('Maximum entries', 1, 10000) }, ['path']) },
   { name: 'file.stat', description: 'Return filesystem metadata for a path.', inputSchema: inputSchema({ path: S.string('Path') }, ['path']) },
   { name: 'file.mkdir', description: 'Create a directory.', inputSchema: inputSchema({ path: S.string('Directory path'), recursive: S.boolean('Create parents') }, ['path']) },
   { name: 'file.move', description: 'Move or rename a file or directory.', inputSchema: inputSchema({ source: S.string('Source path'), destination: S.string('Destination path'), overwrite: S.boolean('Replace destination if it exists') }, ['source', 'destination']) },
   { name: 'file.copy', description: 'Copy a file or directory.', inputSchema: inputSchema({ source: S.string('Source path'), destination: S.string('Destination path'), recursive: S.boolean('Copy directories recursively'), overwrite: S.boolean('Replace destination') }, ['source', 'destination']) },
-  { name: 'file.delete', description: 'Delete a file or directory.', inputSchema: inputSchema({ path: S.string('Path'), recursive: S.boolean('Delete directory tree'), force: S.boolean('Ignore missing path') }, ['path']) },
+  { name: 'file.delete', description: 'Move a file or directory to the Windows Recycle Bin. Permanent deletion is prohibited by GoGoMCP policy.', inputSchema: inputSchema({ path: S.string('Path'), recursive: S.boolean('Accepted for compatibility; directories are recycled as a whole'), force: S.boolean('Ignore missing path') }, ['path']) },
   { name: 'file.hash', description: 'Calculate a file cryptographic hash.', inputSchema: inputSchema({ path: S.string('File path'), algorithm: { type: 'string', enum: ['sha256', 'sha512', 'md5'] } }, ['path']) },
   { name: 'file.tail', description: 'Read the last N lines from a text file.', inputSchema: inputSchema({ path: S.string('File path'), lines: S.integer('Line count', 1, 5000) }, ['path']) },
   { name: 'file.find', description: 'Find paths below a root using a wildcard-like name pattern.', inputSchema: inputSchema({ root: S.string('Root directory'), pattern: S.string('Case-insensitive substring or * wildcard pattern'), maxResults: S.integer('Maximum results', 1, 5000) }, ['root', 'pattern']) },
@@ -286,7 +341,10 @@ async function callTool(name, a) {
     case 'process.get':
       return powershell(`Get-CimInstance Win32_Process -Filter \"ProcessId=${Number(a.pid)}\" | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,CreationDate | ConvertTo-Json -Compress`);
     case 'process.start': {
-      const child = spawn(a.file, Array.isArray(a.args) ? a.args : [], { cwd: a.cwd || undefined, detached: true, stdio: 'ignore', windowsHide: true });
+      const args = Array.isArray(a.args) ? a.args : [];
+      const base = path.basename(String(a.file || '')).toLowerCase();
+      if (/^(?:cmd|powershell|pwsh|node|python|python3)(?:\.exe)?$/.test(base)) assertNoPermanentDeleteCommand([a.file, ...args].join(' '), 'process.start');
+      const child = spawn(a.file, args, { cwd: a.cwd || undefined, detached: true, stdio: 'ignore', windowsHide: true });
       child.unref();
       return { ok: true, pid: child.pid };
     }
@@ -305,6 +363,7 @@ async function callTool(name, a) {
 
     case 'shell.run': {
       const timeoutMs = (a.timeoutSeconds || 60) * 1000;
+      assertNoPermanentDeleteCommand(a.command, 'shell.run');
       if ((a.shell || 'powershell') === 'cmd') return run('cmd.exe', ['/d', '/s', '/c', a.command], { cwd: a.cwd, timeoutMs });
       return powershell(a.command, { cwd: a.cwd, timeoutMs });
     }
@@ -318,8 +377,13 @@ async function callTool(name, a) {
       try { const stat = await fh.stat(); const len = Math.min(stat.size, max); const b = Buffer.alloc(len); await fh.read(b, 0, len, 0); return { path: p, size: stat.size, truncated: stat.size > len, encoding: a.encoding || 'utf8', content: (a.encoding === 'base64' ? b.toString('base64') : b.toString('utf8')) }; } finally { await fh.close(); }
     }
     case 'file.write': {
-      const p = normalizePath(a.path); if (a.createParents !== false) await fsp.mkdir(path.dirname(p), { recursive: true });
-      const data = a.encoding === 'base64' ? Buffer.from(a.content, 'base64') : Buffer.from(a.content, 'utf8'); await fsp.writeFile(p, data); return { ok: true, path: p, bytes: data.length };
+      const p = normalizePath(a.path);
+      const existed = fs.existsSync(p);
+      if (existed) recyclePath(p);
+      if (a.createParents !== false) await fsp.mkdir(path.dirname(p), { recursive: true });
+      const data = a.encoding === 'base64' ? Buffer.from(a.content, 'base64') : Buffer.from(a.content, 'utf8');
+      await fsp.writeFile(p, data);
+      return { ok: true, path: p, bytes: data.length, priorVersionRecycled: existed };
     }
     case 'file.append': {
       const p = normalizePath(a.path); if (a.createParents !== false) await fsp.mkdir(path.dirname(p), { recursive: true }); await fsp.appendFile(p, String(a.content), 'utf8'); return { ok: true, path: p };
@@ -330,12 +394,21 @@ async function callTool(name, a) {
     }
     case 'file.mkdir': { const p = normalizePath(a.path); await fsp.mkdir(p, { recursive: a.recursive !== false }); return { ok: true, path: p }; }
     case 'file.move': {
-      const s = normalizePath(a.source), d = normalizePath(a.destination); if (a.overwrite) await fsp.rm(d, { recursive: true, force: true }).catch(() => {}); await fsp.mkdir(path.dirname(d), { recursive: true }); await fsp.rename(s, d); return { ok: true, source: s, destination: d };
+      const s = normalizePath(a.source), d = normalizePath(a.destination);
+      if (fs.existsSync(d)) { if (!a.overwrite) throw new Error('Destination exists: ' + d); recyclePath(d); }
+      await fsp.mkdir(path.dirname(d), { recursive: true });
+      await fsp.rename(s, d);
+      return { ok: true, source: s, destination: d };
     }
     case 'file.copy': {
-      const s = normalizePath(a.source), d = normalizePath(a.destination); if (a.overwrite) await fsp.rm(d, { recursive: true, force: true }).catch(() => {}); const st = await fsp.stat(s); await fsp.mkdir(path.dirname(d), { recursive: true }); if (st.isDirectory()) { if (!a.recursive) throw new Error('source is a directory; recursive=true required'); await fsp.cp(s, d, { recursive: true, force: !!a.overwrite }); } else await fsp.copyFile(s, d); return { ok: true, source: s, destination: d };
+      const s = normalizePath(a.source), d = normalizePath(a.destination);
+      if (fs.existsSync(d)) { if (!a.overwrite) throw new Error('Destination exists: ' + d); recyclePath(d); }
+      const st = await fsp.stat(s); await fsp.mkdir(path.dirname(d), { recursive: true });
+      if (st.isDirectory()) { if (!a.recursive) throw new Error('source is a directory; recursive=true required'); await fsp.cp(s, d, { recursive: true, force: false, errorOnExist: true }); }
+      else await fsp.copyFile(s, d, fs.constants.COPYFILE_EXCL);
+      return { ok: true, source: s, destination: d };
     }
-    case 'file.delete': { const p = normalizePath(a.path); await fsp.rm(p, { recursive: !!a.recursive, force: !!a.force }); return { ok: true, path: p }; }
+    case 'file.delete': return recyclePath(a.path, { force: !!a.force });
     case 'file.hash': {
       const p = normalizePath(a.path), algo = a.algorithm || 'sha256'; const h = crypto.createHash(algo); await new Promise((resolve, reject) => { const s = fs.createReadStream(p); s.on('data', d => h.update(d)); s.on('error', reject); s.on('end', resolve); }); return { path: p, algorithm: algo, hash: h.digest('hex') };
     }
@@ -356,7 +429,9 @@ async function callTool(name, a) {
     case 'docker.images': return docker(['images', '--format', '{{json .}}']);
     case 'docker.compose_ps': return docker(['compose', 'ps', '--format', 'json'], { cwd: a.cwd });
     case 'docker.compose_up': return docker(['compose', 'up', '-d', ...(a.build ? ['--build'] : []), ...(Array.isArray(a.services) ? a.services : [])], { cwd: a.cwd, timeoutMs: 300000 });
-    case 'docker.compose_down': return docker(['compose', 'down', ...(a.volumes ? ['-v'] : [])], { cwd: a.cwd, timeoutMs: 300000 });
+    case 'docker.compose_down':
+      if (a.volumes) throw new Error('PERMANENT_DELETE_BLOCKED: docker.compose_down volumes=true would permanently remove named volumes.');
+      return docker(['compose', 'down'], { cwd: a.cwd, timeoutMs: 300000 });
 
     case 'git.status': return git(['status', '--short', '--branch'], { cwd: a.cwd });
     case 'git.fetch': return git(['fetch', a.remote || 'origin', ...(a.prune ? ['--prune'] : [])], { cwd: a.cwd, timeoutMs: 300000 });
@@ -375,9 +450,16 @@ async function callTool(name, a) {
     case 'remote.targets': return remote.targets();
     case 'remote.health': return await remote.health(a.target);
     case 'remote.list_tools': return await remote.listTools(a.target);
-    case 'remote.call': return await remote.call(a.target, a.tool, a.arguments || {});
+    case 'remote.call': {
+      if (isDeleteLikeRemoteTool(a.tool)) throw new Error('PERMANENT_DELETE_BLOCKED: remote tool ' + a.tool + ' appears to delete/remove data. A remote recycle-bin-aware tool is required.');
+      const remoteArgs = a.arguments || {};
+      if (/(^|[._-])(shell[._-]?run|process[._-]?start)($|[._-])/i.test(String(a.tool || ''))) assertNoPermanentDeleteCommand(JSON.stringify(remoteArgs), 'remote.call');
+      return await remote.call(a.target, a.tool, remoteArgs);
+    }
 
-    case 'http.request': return await httpRequest(a);
+    case 'http.request':
+      if (String(a.method || 'GET').toUpperCase() === 'DELETE') throw new Error('PERMANENT_DELETE_BLOCKED: HTTP DELETE is disabled by GoGoMCP policy.');
+      return await httpRequest(a);
     default: throw new Error(`Unknown tool: ${name}`);
   }
 }
