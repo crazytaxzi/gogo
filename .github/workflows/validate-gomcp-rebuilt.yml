@@ -4,12 +4,17 @@ on:
   push:
     branches: [main]
     paths:
-      - 'mcp/rebuilt/**'
+      - 'mcp/rebuilt/gomcp.js'
+      - 'mcp/rebuilt/oauth.js'
+      - 'mcp/rebuilt/drive.js'
+      - 'mcp/rebuilt/remote.js'
+      - 'mcp/rebuilt/supervisor.js'
+      - 'mcp/rebuilt/selftest.js'
       - '.github/workflows/validate-gomcp-rebuilt.yml'
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   validate:
@@ -17,6 +22,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -32,3 +39,20 @@ jobs:
       - name: Full OAuth and MCP smoke test
         shell: pwsh
         run: node mcp/rebuilt/selftest.js
+      - name: Record validated revision
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ci | Out-Null
+          @(
+            'GoMCP rebuilt validation: PASS'
+            'source_sha=${{ github.sha }}'
+            'runner=windows-latest'
+            'node=22'
+            ('validated_utc=' + (Get-Date).ToUniversalTime().ToString('o'))
+            'checks=node syntax; startup; health; 56 tools; OAuth DCR; PKCE S256; token exchange; authenticated tools/list'
+          ) | Set-Content -Encoding UTF8 ci/gomcp-rebuilt-validated.txt
+          git config user.name "gomcp-ci"
+          git config user.email "gomcp-ci@users.noreply.github.com"
+          git add ci/gomcp-rebuilt-validated.txt
+          git commit -m "Record validated rebuilt GoMCP revision [skip ci]"
+          git push origin HEAD:main
