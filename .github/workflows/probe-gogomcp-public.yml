@@ -1,0 +1,29 @@
+name: Probe GoGoMCP Public
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/probe-gogomcp-public.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Probe public GoGoMCP
+        shell: bash
+        run: |
+          set -euo pipefail
+          url='https://gamepc-mcp.sentionce.net/health'
+          echo "url=$url"
+          code="$(curl --max-time 20 -sS -D /tmp/headers -o /tmp/body -w '%{http_code}' "$url" || true)"
+          echo "status=$code"
+          echo '--- headers ---'
+          cat /tmp/headers || true
+          echo '--- body ---'
+          cat /tmp/body || true
+          test "$code" = '200'
