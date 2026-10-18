@@ -158,7 +158,82 @@ async function main() {
     assert(names.has(name), 'Missing rebuilt tool ' + name);
   }
 
-  console.log('SELFTEST PASS: OAuth DCR + PKCE + authenticated 56-tool MCP verified');
+  let rpcId = 10;
+  async function callTool(name, args) {
+    const r = await fetch(base + '/mcp', {
+      method:'POST',
+      headers:{
+        authorization:'Bearer ' + tokens.access_token,
+        'content-type':'application/json',
+        accept:'application/json',
+        'mcp-protocol-version':'2026-07-28',
+      },
+      body:JSON.stringify({
+        jsonrpc:'2.0',
+        id:rpcId++,
+        method:'tools/call',
+        params:{ name, arguments:args || {} },
+      }),
+    });
+    if (!r.ok) throw new Error('tools/call ' + name + ' failed HTTP ' + r.status + ': ' + await r.text());
+    const body = await r.json();
+    assert(body.result, 'tools/call ' + name + ' returned no result');
+    return body.result;
+  }
+
+  const blockedFile = path.join(temp, 'must-survive-shell-delete.txt');
+  fs.writeFileSync(blockedFile, 'survive me', 'utf8');
+  const blocked = await callTool('shell.run', {
+    shell:'powershell',
+    command:"Remove-Item -LiteralPath '" + blockedFile.replace(/'/g, "''") + "' -Force",
+  });
+  assert(blocked.isError === true, 'shell.run destructive command was not rejected');
+  assert(
+    blocked.structuredContent &&
+    /PERMANENT_DELETE_BLOCKED/.test(String(blocked.structuredContent.error || '')),
+    'shell.run rejection did not report PERMANENT_DELETE_BLOCKED'
+  );
+  assert(fs.existsSync(blockedFile), 'shell.run deletion guard did not preserve the test file');
+
+  const recycleFile = path.join(temp, 'gomcp-recycle-selftest-' + crypto.randomBytes(6).toString('hex') + '.txt');
+  fs.writeFileSync(recycleFile, 'recycle me', 'utf8');
+  const recycled = await callTool('file.delete', { path:recycleFile, force:false });
+  assert(recycled.isError !== true, 'file.delete recycle operation failed');
+  assert(
+    recycled.structuredContent &&
+    recycled.structuredContent.result &&
+    recycled.structuredContent.result.recycled === true,
+    'file.delete did not report recycled=true'
+  );
+  assert(!fs.existsSync(recycleFile), 'file.delete left the recycled source path in place');
+
+  const overwriteFile = path.join(temp, 'gomcp-overwrite-selftest.txt');
+  fs.writeFileSync(overwriteFile, 'old version', 'utf8');
+  const rewritten = await callTool('file.write', {
+    path:overwriteFile,
+    content:'new version',
+    encoding:'utf8',
+    createParents:true,
+  });
+  assert(rewritten.isError !== true, 'file.write overwrite operation failed');
+  assert(
+    rewritten.structuredContent &&
+    rewritten.structuredContent.result &&
+    rewritten.structuredContent.result.priorVersionRecycled === true,
+    'file.write did not preserve the prior version through Recycle Bin'
+  );
+  assert(fs.readFileSync(overwriteFile, 'utf8') === 'new version', 'file.write replacement content mismatch');
+
+  const rootPath = path.parse(temp).root;
+  const rootBlocked = await callTool('file.delete', { path:rootPath, force:false });
+  assert(rootBlocked.isError === true, 'drive-root recycle attempt was not blocked');
+  assert(
+    rootBlocked.structuredContent &&
+    /RECYCLE_BLOCKED/.test(String(rootBlocked.structuredContent.error || '')),
+    'drive-root guard did not report RECYCLE_BLOCKED'
+  );
+
+  console.log('SELFTEST PASS: OAuth + 56 tools + permanent-delete guard + Recycle Bin semantics verified');
 }
 
 main().then(() => {
