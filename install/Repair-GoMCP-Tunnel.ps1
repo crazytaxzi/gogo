@@ -79,30 +79,20 @@ function Invoke-Cloudflared {
         [Parameter(Mandatory=$true)][string]$Exe,
         [Parameter(Mandatory=$true)][string[]]$Args
     )
-    $oldPref = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
+    $outFile = Join-Path $env:TEMP ('cloudflared-' + [guid]::NewGuid().ToString('N') + '.out.txt')
+    $errFile = Join-Path $env:TEMP ('cloudflared-' + [guid]::NewGuid().ToString('N') + '.err.txt')
     try {
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $Exe
-        $psi.UseShellExecute = $false
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
-        $psi.CreateNoWindow = $true
-        foreach ($a in $Args) { [void]$psi.ArgumentList.Add($a) }
-        $p = New-Object System.Diagnostics.Process
-        $p.StartInfo = $psi
-        [void]$p.Start()
-        $stdout = $p.StandardOutput.ReadToEnd()
-        $stderr = $p.StandardError.ReadToEnd()
-        $p.WaitForExit()
+        $p = Start-Process -FilePath $Exe -ArgumentList $Args -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        $stdout = if (Test-Path $outFile) { Get-Content $outFile -Raw -ErrorAction SilentlyContinue } else { '' }
+        $stderr = if (Test-Path $errFile) { Get-Content $errFile -Raw -ErrorAction SilentlyContinue } else { '' }
         return [pscustomobject]@{
-            ExitCode = $p.ExitCode
-            StdOut = $stdout
-            StdErr = $stderr
-            Combined = (($stdout + [Environment]::NewLine + $stderr).Trim())
+            ExitCode = [int]$p.ExitCode
+            StdOut = [string]$stdout
+            StdErr = [string]$stderr
+            Combined = (([string]$stdout + [Environment]::NewLine + [string]$stderr).Trim())
         }
     } finally {
-        $ErrorActionPreference = $oldPref
+        Remove-Item $outFile,$errFile -Force -ErrorAction SilentlyContinue
     }
 }
 function Get-TunnelList([string]$Cloudflared,[string]$Cert) {
