@@ -6,6 +6,39 @@ const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
 
+function parseRpcEnvelope(textBody, contentType) {
+  const type = String(contentType || '').toLowerCase();
+
+  if (type.includes('text/event-stream') || /^\s*(?:event:|data:)/m.test(textBody)) {
+    const events = String(textBody || '').split(/\r?\n\r?\n/);
+    let last = null;
+
+    for (const event of events) {
+      const data = event
+        .split(/\r?\n/)
+        .filter(line => line.startsWith('data:'))
+        .map(line => line.slice(5).replace(/^\s/, ''))
+        .join('\n')
+        .trim();
+
+      if (!data || data === '[DONE]') continue;
+
+      try {
+        last = JSON.parse(data);
+      } catch {}
+    }
+
+    if (last) return last;
+    throw new Error('Remote MCP returned SSE without a JSON data event');
+  }
+
+  try {
+    return JSON.parse(textBody);
+  } catch {
+    throw new Error('Remote MCP returned neither JSON nor parseable SSE');
+  }
+}
+
 function createRemote(options) {
   const configFile = options.configFile;
   const protocolVersion = options.protocolVersion || '2025-11-25';
@@ -79,8 +112,8 @@ function createRemote(options) {
             return;
           }
           let parsed;
-          try { parsed = JSON.parse(textBody); }
-          catch { reject(new Error('Remote MCP returned non-JSON response')); return; }
+          try { parsed = parseRpcEnvelope(textBody, res.headers['content-type']); }
+          catch (err) { reject(err); return; }
           if (parsed.error) { reject(new Error(parsed.error.message || JSON.stringify(parsed.error))); return; }
           resolve(parsed.result);
         });
