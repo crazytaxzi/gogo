@@ -31,8 +31,8 @@ const child = spawn(process.execPath, [path.join(sourceDir, 'gomcp.js')], {
     GOMCP_DRIVE_ROOT: drive,
     GOMCP_REMOTE_TARGETS: remoteFile,
     SENTIONCE_MUTATION_FIREWALL_MODE: 'required',
-    SENTIONCE_MUTATION_FIREWALL_EXE: 'E:\\SentionceRecovery\\MutationFirewall\\publish\\SentionceMutationFirewall.exe',
-    SENTIONCE_MUTATION_FIREWALL_POLICY: 'E:\\SentionceRecovery\\MutationFirewall\\policy.json',
+    SENTIONCE_MUTATION_FIREWALL_EXE: process.env.SENTIONCE_MUTATION_FIREWALL_EXE || 'E:\\SentionceRecovery\\MutationFirewall\\publish\\SentionceMutationFirewall.exe',
+    SENTIONCE_MUTATION_FIREWALL_POLICY: process.env.SENTIONCE_MUTATION_FIREWALL_POLICY || 'E:\\SentionceRecovery\\MutationFirewall\\policy.json',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
