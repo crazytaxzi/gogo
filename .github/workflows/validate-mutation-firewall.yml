@@ -7,6 +7,9 @@ on:
       - safety/mutation-firewall-v0
     paths:
       - 'security/mutation-firewall/**'
+      - 'mcp/rebuilt/gomcp.js'
+      - 'mcp/rebuilt/selftest.js'
+      - 'mcp/rebuilt/mutation-firewall.js'
       - '.github/workflows/validate-mutation-firewall.yml'
   workflow_dispatch:
 
@@ -16,7 +19,8 @@ permissions:
 jobs:
   test:
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
+
     steps:
       - uses: actions/checkout@v4
 
@@ -24,21 +28,44 @@ jobs:
         with:
           dotnet-version: '9.0.x'
 
-      - name: Build
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build firewall engine
         shell: pwsh
         run: dotnet build security/mutation-firewall/src/MutationFirewall.csproj -c Release
 
-      - name: Deterministic self-test
+      - name: Build independent broker service
+        shell: pwsh
+        run: dotnet build security/mutation-firewall/service/MutationFirewallService.csproj -c Release
+
+      - name: Deterministic engine self-test
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force C:\Projects | Out-Null
           dotnet run --project security/mutation-firewall/src/MutationFirewall.csproj -c Release --no-build -- selftest --policy security/mutation-firewall/ci-policy.json
 
-      - name: Publish self-contained Windows executable
+      - name: Publish self-contained Windows firewall
         shell: pwsh
-        run: dotnet publish security/mutation-firewall/src/MutationFirewall.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o $env:RUNNER_TEMP\mutation-firewall-publish
+        run: |
+          dotnet publish security/mutation-firewall/src/MutationFirewall.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o "$env:RUNNER_TEMP\mutation-firewall-publish"
 
-      - name: Test published executable
+      - name: Test published firewall executable
         shell: pwsh
         run: |
           & "$env:RUNNER_TEMP\mutation-firewall-publish\SentionceMutationFirewall.exe" selftest --policy security/mutation-firewall/ci-policy.json
+
+      - name: GoGoMCP integration syntax
+        shell: pwsh
+        run: |
+          node --check mcp/rebuilt/gomcp.js
+          node --check mcp/rebuilt/mutation-firewall.js
+          node --check mcp/rebuilt/selftest.js
+
+      - name: GoGoMCP + Mutation Firewall integration smoke test
+        shell: pwsh
+        run: |
+          $env:SENTIONCE_MUTATION_FIREWALL_EXE = "$env:RUNNER_TEMP\mutation-firewall-publish\SentionceMutationFirewall.exe"
+          $env:SENTIONCE_MUTATION_FIREWALL_POLICY = "$env:GITHUB_WORKSPACE\security\mutation-firewall\ci-policy.json"
+          node mcp/rebuilt/selftest.js
