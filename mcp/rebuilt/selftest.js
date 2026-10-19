@@ -30,6 +30,9 @@ const child = spawn(process.execPath, [path.join(sourceDir, 'gomcp.js')], {
     GOMCP_PUBLIC_BASE: base,
     GOMCP_DRIVE_ROOT: drive,
     GOMCP_REMOTE_TARGETS: remoteFile,
+    SENTIONCE_MUTATION_FIREWALL_MODE: 'required',
+    SENTIONCE_MUTATION_FIREWALL_EXE: 'E:\\SentionceRecovery\\MutationFirewall\\publish\\SentionceMutationFirewall.exe',
+    SENTIONCE_MUTATION_FIREWALL_POLICY: 'E:\\SentionceRecovery\\MutationFirewall\\policy.json',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -181,6 +184,41 @@ async function main() {
     return body.result;
   }
 
+  const harmlessFormat = await callTool('shell.run', {
+    shell:'powershell',
+    command:"Write-Output '--format=csv,noheader'",
+  });
+  assert(harmlessFormat.isError !== true, 'harmless --format option was falsely blocked by Mutation Firewall');
+
+  const overwriteGuardFile = path.join(temp, 'must-survive-overwrite.txt');
+  fs.writeFileSync(overwriteGuardFile, 'original', 'utf8');
+  const overwriteBlocked = await callTool('shell.run', {
+    shell:'powershell',
+    command:"Set-Content -LiteralPath '" + overwriteGuardFile.replace(/'/g, "''") + "' -Value 'replacement'",
+  });
+  assert(overwriteBlocked.isError === true, 'overwrite-capable shell command was not broker-gated');
+  assert(
+    overwriteBlocked.structuredContent &&
+    /MUTATION_BROKER_REQUIRED/.test(String(overwriteBlocked.structuredContent.error || '')),
+    'overwrite guard did not report MUTATION_BROKER_REQUIRED'
+  );
+  assert(fs.readFileSync(overwriteGuardFile, 'utf8') === 'original', 'overwrite guard failed to preserve original content');
+
+  const protectedWritePath = path.join(path.parse(temp).root, 'Windows', 'System32', 'sentionce-mutation-firewall-should-not-exist.txt');
+  const protectedWrite = await callTool('file.write', {
+    path:protectedWritePath,
+    content:'must never be written',
+    encoding:'utf8',
+    createParents:false,
+  });
+  assert(protectedWrite.isError === true, 'protected-root file.write was not rejected');
+  assert(
+    protectedWrite.structuredContent &&
+    /MUTATION_FIREWALL_BLOCKED/.test(String(protectedWrite.structuredContent.error || '')),
+    'protected-root file.write did not report MUTATION_FIREWALL_BLOCKED'
+  );
+  assert(!fs.existsSync(protectedWritePath), 'protected-root file.write created a file');
+
   const blockedFile = path.join(temp, 'must-survive-shell-delete.txt');
   fs.writeFileSync(blockedFile, 'survive me', 'utf8');
   const blocked = await callTool('shell.run', {
@@ -190,8 +228,8 @@ async function main() {
   assert(blocked.isError === true, 'shell.run destructive command was not rejected');
   assert(
     blocked.structuredContent &&
-    /PERMANENT_DELETE_BLOCKED/.test(String(blocked.structuredContent.error || '')),
-    'shell.run rejection did not report PERMANENT_DELETE_BLOCKED'
+    /MUTATION_FIREWALL_BLOCKED/.test(String(blocked.structuredContent.error || '')),
+    'shell.run rejection did not report MUTATION_FIREWALL_BLOCKED'
   );
   assert(fs.existsSync(blockedFile), 'shell.run deletion guard did not preserve the test file');
 
@@ -202,8 +240,8 @@ async function main() {
   assert(
     recycled.structuredContent &&
     recycled.structuredContent.result &&
-    recycled.structuredContent.result.recycled === true,
-    'file.delete did not report recycled=true'
+    recycled.structuredContent.result.quarantined === true,
+    'file.delete did not report quarantined=true'
   );
   assert(!fs.existsSync(recycleFile), 'file.delete left the recycled source path in place');
 
@@ -219,8 +257,8 @@ async function main() {
   assert(
     rewritten.structuredContent &&
     rewritten.structuredContent.result &&
-    rewritten.structuredContent.result.priorVersionRecycled === true,
-    'file.write did not preserve the prior version through Recycle Bin'
+    rewritten.structuredContent.result.priorVersionQuarantined === true,
+    'file.write did not preserve the prior version through Mutation Firewall quarantine'
   );
   assert(fs.readFileSync(overwriteFile, 'utf8') === 'new version', 'file.write replacement content mismatch');
 
@@ -229,11 +267,11 @@ async function main() {
   assert(rootBlocked.isError === true, 'drive-root recycle attempt was not blocked');
   assert(
     rootBlocked.structuredContent &&
-    /RECYCLE_BLOCKED/.test(String(rootBlocked.structuredContent.error || '')),
-    'drive-root guard did not report RECYCLE_BLOCKED'
+    /MUTATION_FIREWALL_BLOCKED/.test(String(rootBlocked.structuredContent.error || '')),
+    'drive-root guard did not report MUTATION_FIREWALL_BLOCKED'
   );
 
-  console.log('SELFTEST PASS: OAuth + 56 tools + permanent-delete guard + Recycle Bin semantics verified');
+  console.log('SELFTEST PASS: OAuth + 56 tools + Mutation Firewall command guard + broker gating + protected roots + quarantine semantics verified');
 }
 
 main().then(() => {
