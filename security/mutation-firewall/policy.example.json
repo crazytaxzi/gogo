@@ -1,0 +1,31 @@
+{
+  "policyVersion": 1,
+  "auditLog": "E:\\SentionceRecovery\\MutationFirewall\\logs\\mutation-firewall.jsonl",
+  "denyReparsePoints": true,
+  "autoLimits": {
+    "maxFiles": 500,
+    "maxDirectories": 1000,
+    "maxBytes": 1073741824
+  },
+  "protectedRoots": [
+    "C:\\Windows",
+    "C:\\Program Files",
+    "C:\\Program Files (x86)",
+    "C:\\ProgramData\\SentionceTunnels",
+    "C:\\SentionceRecovery",
+    "E:\\SentionceRecovery"
+  ],
+  "protectedExactPaths": [
+    "C:\\",
+    "D:\\",
+    "E:\\",
+    "C:\\Projects",
+    "E:\\AIExperiments",
+    "C:\\actions-runner\\GoMCP"
+  ],
+  "quarantineRoots": {
+    "C:\\": "C:\\SentionceQuarantine",
+    "D:\\": "D:\\SentionceQuarantine",
+    "E:\\": "E:\\SentionceRecovery\\Quarantine"
+  }
+}
