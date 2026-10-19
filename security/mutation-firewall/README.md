@@ -71,3 +71,47 @@ E-drive quarantine:
 - Overwrite means preserve-old-then-replace.
 - Restore verifies quarantine provenance and file hash when available.
 - Large mutations fail closed.
+
+
+## Checkpoint: 2026-10-18
+
+Verified on GamePC:
+
+- engine build: 0 warnings, 0 errors
+- engine self-test: 15/15 passing
+- self-contained win-x64 engine published
+- SHA-256 of current published engine: `1658535e07dcce1a8a2af75afa0e2c0a44a0e09a1ee107d0825454ddba15725f`
+- real sacrificial overwrite preserved the original in quarantine
+- real sacrificial file quarantine preserved content and manifest
+- real whole-directory quarantine passed
+- independent named-pipe broker service builds with 0 warnings/errors
+- broker console-mode named-pipe request passed
+- broker-mediated sacrificial quarantine passed
+- broker test process was stopped after testing
+- staged GoGoMCP 0.5.0 integration passed OAuth + 56-tool smoke test on random non-production ports
+- staged integration verified harmless `--format` is allowed
+- staged integration verified overwrite-capable shell commands are broker-gated
+- staged integration verified writes beneath `C:\Windows` are blocked
+- staged integration verified file.delete uses quarantine semantics
+- staged integration verified file.write preserves the prior version
+
+Production state at this checkpoint:
+
+- live GoGoMCP has NOT been replaced with the staged integration
+- Mutation Firewall service has NOT been installed
+- no Windows account/ACL changes have been made
+- StreamingPC/MSI has NOT been modified by this work
+- the current work is isolated under `E:\SentionceRecovery\MutationFirewall`
+- GitHub safety branch: `safety/mutation-firewall-v0`
+
+Remaining promotion gates:
+
+- GitHub-hosted integration CI result
+- explicit junction/reparse escape regression
+- explicit oversized-tree blast-radius regression
+- named-pipe ACL tightening before privileged service deployment
+- sacrificial restricted Windows identity/workspace test
+- compiler/package-manager/dev workflow compatibility under restricted identity
+- watchdog service-health integration
+- GamePC production canary period
+- only then reproduce the proven design on StreamingPC
