@@ -107,8 +107,8 @@ Production state at this checkpoint:
 Remaining promotion gates:
 
 - GitHub-hosted integration CI result
-- explicit junction/reparse escape regression
-- explicit oversized-tree blast-radius regression
+- junction/reparse escape regression: PASS on GamePC
+- oversized-tree blast-radius regression: PASS at 502 files against 500-file ceiling
 - named-pipe ACL tightening before privileged service deployment
 - sacrificial restricted Windows identity/workspace test
 - compiler/package-manager/dev workflow compatibility under restricted identity
