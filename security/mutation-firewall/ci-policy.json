@@ -1,0 +1,22 @@
+{
+  "policyVersion": 1,
+  "auditLog": "%RUNNER_TEMP%\\SentionceMutationFirewall\\audit.jsonl",
+  "denyReparsePoints": true,
+  "autoLimits": {
+    "maxFiles": 500,
+    "maxDirectories": 1000,
+    "maxBytes": 1073741824
+  },
+  "protectedRoots": [
+    "C:\\Windows",
+    "C:\\Program Files",
+    "C:\\Program Files (x86)"
+  ],
+  "protectedExactPaths": [
+    "C:\\",
+    "C:\\Projects"
+  ],
+  "quarantineRoots": {
+    "C:\\": "%RUNNER_TEMP%\\SentionceMutationFirewall\\Quarantine"
+  }
+}
