@@ -13,8 +13,9 @@ const { spawn, spawnSync, execFileSync } = require('child_process');
 const { createOAuth } = require('./oauth');
 const { createDrive } = require('./drive');
 const { createRemote } = require('./remote');
+const { createMutationFirewall } = require('./mutation-firewall');
 
-const VERSION = '0.4.1-recycle-safe';
+const VERSION = '0.5.0-mutation-firewall-stage';
 const PROTOCOL_CURRENT = '2026-07-28';
 const PROTOCOL_LEGACY_CURRENT = '2025-11-25';
 const PROTOCOL_LEGACY = new Set(['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25']);
@@ -50,6 +51,7 @@ const REMOTE_TARGETS_FILE = process.env.GOMCP_REMOTE_TARGETS || path.join(HOME, 
 const oauth = createOAuth({ stateDir: STATE_DIR, publicBase: PUBLIC_BASE, staticToken: MCP_TOKEN });
 const drive = createDrive({ root: process.env.GOMCP_DRIVE_ROOT || 'E:\\GoMCPdrive', publicBase: PUBLIC_BASE, signingToken: MCP_TOKEN });
 const remote = createRemote({ configFile: REMOTE_TARGETS_FILE, protocolVersion: PROTOCOL_LEGACY_CURRENT });
+const mutationFirewall = createMutationFirewall();
 
 function safeEqual(a, b) {
   const aa = Buffer.from(String(a || ''), 'utf8');
@@ -138,6 +140,12 @@ function assertNoPermanentDeleteCommand(command, context = 'command') {
   if (reason) throw new Error('PERMANENT_DELETE_BLOCKED: ' + context + ' contains ' + reason + '. GoGoMCP policy requires files/directories to be moved to the Windows Recycle Bin instead.');
 }
 
+function assertSafeMutationCommand(command, context = 'command') {
+  if (mutationFirewall.enabled) return mutationFirewall.enforceCommand(command, context);
+  return assertNoPermanentDeleteCommand(command, context);
+}
+
+
 function isDeleteLikeRemoteTool(name) {
   const n = String(name || '').toLowerCase();
   if (n.includes('recycle') || n.includes('trash')) return false;
@@ -208,18 +216,18 @@ const TOOLS = [
   { name: 'process.stop', description: 'Stop a process by PID.', inputSchema: inputSchema({ pid: S.integer('Process ID', 1), force: S.boolean('Force termination') }, ['pid']) },
   { name: 'process.tree', description: 'Return process parent/child relationships.', inputSchema: inputSchema({ pid: S.integer('Optional root PID', 0) }) },
 
-  { name: 'shell.run', description: 'Run a PowerShell or cmd command with timeout and capture output. Permanent filesystem deletion commands are blocked; use file.delete to send items to the Windows Recycle Bin.', inputSchema: inputSchema({ command: S.string('Command text'), shell: { type: 'string', enum: ['powershell', 'cmd'] }, cwd: S.string('Optional working directory'), timeoutSeconds: S.integer('Timeout seconds', 1, 300) }, ['command']) },
+  { name: 'shell.run', description: 'Run a PowerShell or cmd command with timeout and capture output. When Mutation Firewall is enabled, destructive and overwrite-capable commands are blocked or routed to structured mutation tools.', inputSchema: inputSchema({ command: S.string('Command text'), shell: { type: 'string', enum: ['powershell', 'cmd'] }, cwd: S.string('Optional working directory'), timeoutSeconds: S.integer('Timeout seconds', 1, 300) }, ['command']) },
   { name: 'shell.which', description: 'Resolve an executable or command name using Windows command discovery.', inputSchema: inputSchema({ name: S.string('Command name') }, ['name']) },
 
   { name: 'file.read', description: 'Read a UTF-8 text file or return base64 for binary data.', inputSchema: inputSchema({ path: S.string('File path'), encoding: { type: 'string', enum: ['utf8', 'base64'] }, maxBytes: S.integer('Maximum bytes', 1, 16777216) }, ['path']) },
-  { name: 'file.write', description: 'Replace a file with UTF-8 or base64-decoded content. If the destination exists, the prior file is moved to the Windows Recycle Bin first.', inputSchema: inputSchema({ path: S.string('File path'), content: S.string('Content'), encoding: { type: 'string', enum: ['utf8', 'base64'] }, createParents: S.boolean('Create parent directories') }, ['path', 'content']) },
+  { name: 'file.write', description: 'Replace a file with UTF-8 or base64-decoded content. With Mutation Firewall enabled, the prior version is quarantined before replacement.', inputSchema: inputSchema({ path: S.string('File path'), content: S.string('Content'), encoding: { type: 'string', enum: ['utf8', 'base64'] }, createParents: S.boolean('Create parent directories') }, ['path', 'content']) },
   { name: 'file.append', description: 'Append UTF-8 text to a file.', inputSchema: inputSchema({ path: S.string('File path'), content: S.string('Text to append'), createParents: S.boolean('Create parent directories') }, ['path', 'content']) },
   { name: 'file.list', description: 'List directory entries.', inputSchema: inputSchema({ path: S.string('Directory path'), recursive: S.boolean('Recurse'), maxEntries: S.integer('Maximum entries', 1, 10000) }, ['path']) },
   { name: 'file.stat', description: 'Return filesystem metadata for a path.', inputSchema: inputSchema({ path: S.string('Path') }, ['path']) },
   { name: 'file.mkdir', description: 'Create a directory.', inputSchema: inputSchema({ path: S.string('Directory path'), recursive: S.boolean('Create parents') }, ['path']) },
   { name: 'file.move', description: 'Move or rename a file or directory.', inputSchema: inputSchema({ source: S.string('Source path'), destination: S.string('Destination path'), overwrite: S.boolean('Replace destination if it exists') }, ['source', 'destination']) },
   { name: 'file.copy', description: 'Copy a file or directory.', inputSchema: inputSchema({ source: S.string('Source path'), destination: S.string('Destination path'), recursive: S.boolean('Copy directories recursively'), overwrite: S.boolean('Replace destination') }, ['source', 'destination']) },
-  { name: 'file.delete', description: 'Move a file or directory to the Windows Recycle Bin. Permanent deletion is prohibited by GoGoMCP policy.', inputSchema: inputSchema({ path: S.string('Path'), recursive: S.boolean('Accepted for compatibility; directories are recycled as a whole'), force: S.boolean('Ignore missing path') }, ['path']) },
+  { name: 'file.delete', description: 'Quarantine a file or directory through the deterministic Mutation Firewall when enabled. Permanent deletion is prohibited.', inputSchema: inputSchema({ path: S.string('Path'), recursive: S.boolean('Accepted for compatibility; directories are recycled as a whole'), force: S.boolean('Ignore missing path') }, ['path']) },
   { name: 'file.hash', description: 'Calculate a file cryptographic hash.', inputSchema: inputSchema({ path: S.string('File path'), algorithm: { type: 'string', enum: ['sha256', 'sha512', 'md5'] } }, ['path']) },
   { name: 'file.tail', description: 'Read the last N lines from a text file.', inputSchema: inputSchema({ path: S.string('File path'), lines: S.integer('Line count', 1, 5000) }, ['path']) },
   { name: 'file.find', description: 'Find paths below a root using a wildcard-like name pattern.', inputSchema: inputSchema({ root: S.string('Root directory'), pattern: S.string('Case-insensitive substring or * wildcard pattern'), maxResults: S.integer('Maximum results', 1, 5000) }, ['root', 'pattern']) },
@@ -343,7 +351,7 @@ async function callTool(name, a) {
     case 'process.start': {
       const args = Array.isArray(a.args) ? a.args : [];
       const base = path.basename(String(a.file || '')).toLowerCase();
-      if (/^(?:cmd|powershell|pwsh|node|python|python3)(?:\.exe)?$/.test(base)) assertNoPermanentDeleteCommand([a.file, ...args].join(' '), 'process.start');
+      if (/^(?:cmd|powershell|pwsh|node|python|python3)(?:\.exe)?$/.test(base)) assertSafeMutationCommand([a.file, ...args].join(' '), 'process.start');
       const child = spawn(a.file, args, { cwd: a.cwd || undefined, detached: true, stdio: 'ignore', windowsHide: true });
       child.unref();
       return { ok: true, pid: child.pid };
@@ -363,7 +371,7 @@ async function callTool(name, a) {
 
     case 'shell.run': {
       const timeoutMs = (a.timeoutSeconds || 60) * 1000;
-      assertNoPermanentDeleteCommand(a.command, 'shell.run');
+      assertSafeMutationCommand(a.command, 'shell.run');
       if ((a.shell || 'powershell') === 'cmd') return run('cmd.exe', ['/d', '/s', '/c', a.command], { cwd: a.cwd, timeoutMs });
       return powershell(a.command, { cwd: a.cwd, timeoutMs });
     }
@@ -379,22 +387,58 @@ async function callTool(name, a) {
     case 'file.write': {
       const p = normalizePath(a.path);
       const existed = fs.existsSync(p);
+      const data = a.encoding === 'base64' ? Buffer.from(a.content, 'base64') : Buffer.from(a.content, 'utf8');
+
+      if (mutationFirewall.enabled) {
+        mutationFirewall.evaluatePath(p);
+        if (a.createParents !== false) await fsp.mkdir(path.dirname(p), { recursive: true });
+        const stage = path.join(path.dirname(p), '.sentionce-stage-' + process.pid + '-' + crypto.randomBytes(8).toString('hex') + '.tmp');
+        await fsp.writeFile(stage, data, { flag:'wx' });
+        try {
+          const replaced = mutationFirewall.replace(p, stage, 'GoGoMCP file.write');
+          return {
+            ok:true,
+            path:p,
+            bytes:data.length,
+            priorVersionQuarantined:!!replaced.previousVersionQuarantined,
+            previousVersionPath:replaced.previousVersionPath || null,
+          };
+        } catch (err) {
+          try {
+            if (fs.existsSync(stage)) mutationFirewall.quarantine(stage, 'failed staged file.write cleanup');
+          } catch {}
+          throw err;
+        }
+      }
+
       if (existed) recyclePath(p);
       if (a.createParents !== false) await fsp.mkdir(path.dirname(p), { recursive: true });
-      const data = a.encoding === 'base64' ? Buffer.from(a.content, 'base64') : Buffer.from(a.content, 'utf8');
       await fsp.writeFile(p, data);
       return { ok: true, path: p, bytes: data.length, priorVersionRecycled: existed };
     }
     case 'file.append': {
-      const p = normalizePath(a.path); if (a.createParents !== false) await fsp.mkdir(path.dirname(p), { recursive: true }); await fsp.appendFile(p, String(a.content), 'utf8'); return { ok: true, path: p };
+      const p = normalizePath(a.path);
+      if (mutationFirewall.enabled) mutationFirewall.evaluatePath(p);
+      if (a.createParents !== false) await fsp.mkdir(path.dirname(p), { recursive: true });
+      await fsp.appendFile(p, String(a.content), 'utf8');
+      return { ok: true, path: p };
     }
     case 'file.list': return listFiles(normalizePath(a.path), !!a.recursive, Number(a.maxEntries || 2000));
     case 'file.stat': {
       const p = normalizePath(a.path), st = await fsp.stat(p); return { path: p, size: st.size, mode: st.mode, isFile: st.isFile(), isDirectory: st.isDirectory(), created: st.birthtime.toISOString(), modified: st.mtime.toISOString(), accessed: st.atime.toISOString() };
     }
-    case 'file.mkdir': { const p = normalizePath(a.path); await fsp.mkdir(p, { recursive: a.recursive !== false }); return { ok: true, path: p }; }
+    case 'file.mkdir': {
+      const p = normalizePath(a.path);
+      if (mutationFirewall.enabled) mutationFirewall.evaluatePath(p);
+      await fsp.mkdir(p, { recursive: a.recursive !== false });
+      return { ok: true, path: p };
+    }
     case 'file.move': {
       const s = normalizePath(a.source), d = normalizePath(a.destination);
+      if (mutationFirewall.enabled) {
+        if (fs.existsSync(d) && !a.overwrite) throw new Error('Destination exists: ' + d);
+        return mutationFirewall.move(s, d, 'GoGoMCP file.move');
+      }
       if (fs.existsSync(d)) { if (!a.overwrite) throw new Error('Destination exists: ' + d); recyclePath(d); }
       await fsp.mkdir(path.dirname(d), { recursive: true });
       await fsp.rename(s, d);
@@ -402,13 +446,44 @@ async function callTool(name, a) {
     }
     case 'file.copy': {
       const s = normalizePath(a.source), d = normalizePath(a.destination);
-      if (fs.existsSync(d)) { if (!a.overwrite) throw new Error('Destination exists: ' + d); recyclePath(d); }
-      const st = await fsp.stat(s); await fsp.mkdir(path.dirname(d), { recursive: true });
-      if (st.isDirectory()) { if (!a.recursive) throw new Error('source is a directory; recursive=true required'); await fsp.cp(s, d, { recursive: true, force: false, errorOnExist: true }); }
-      else await fsp.copyFile(s, d, fs.constants.COPYFILE_EXCL);
-      return { ok: true, source: s, destination: d };
+      let prior = null;
+      if (mutationFirewall.enabled) {
+        mutationFirewall.evaluatePath(s);
+        mutationFirewall.evaluatePath(d);
+        if (fs.existsSync(d)) {
+          if (!a.overwrite) throw new Error('Destination exists: ' + d);
+          prior = mutationFirewall.quarantine(d, 'GoGoMCP file.copy pre-overwrite checkpoint');
+        }
+      } else if (fs.existsSync(d)) {
+        if (!a.overwrite) throw new Error('Destination exists: ' + d);
+        recyclePath(d);
+      }
+
+      const st = await fsp.stat(s);
+      await fsp.mkdir(path.dirname(d), { recursive: true });
+      if (st.isDirectory()) {
+        if (!a.recursive) throw new Error('source is a directory; recursive=true required');
+        await fsp.cp(s, d, { recursive: true, force: false, errorOnExist: true });
+      } else {
+        await fsp.copyFile(s, d, fs.constants.COPYFILE_EXCL);
+      }
+
+      return {
+        ok:true,
+        source:s,
+        destination:d,
+        priorVersionQuarantined:!!prior,
+        previousVersionPath:prior && prior.quarantinePath ? prior.quarantinePath : null,
+      };
     }
-    case 'file.delete': return recyclePath(a.path, { force: !!a.force });
+    case 'file.delete': {
+      const p = normalizePath(a.path);
+      if (mutationFirewall.enabled) {
+        if (!fs.existsSync(p) && a.force) return { ok:true, path:p, quarantined:false, missing:true };
+        return mutationFirewall.quarantine(p, 'GoGoMCP file.delete');
+      }
+      return recyclePath(p, { force: !!a.force });
+    }
     case 'file.hash': {
       const p = normalizePath(a.path), algo = a.algorithm || 'sha256'; const h = crypto.createHash(algo); await new Promise((resolve, reject) => { const s = fs.createReadStream(p); s.on('data', d => h.update(d)); s.on('error', reject); s.on('end', resolve); }); return { path: p, algorithm: algo, hash: h.digest('hex') };
     }
@@ -453,7 +528,7 @@ async function callTool(name, a) {
     case 'remote.call': {
       if (isDeleteLikeRemoteTool(a.tool)) throw new Error('PERMANENT_DELETE_BLOCKED: remote tool ' + a.tool + ' appears to delete/remove data. A remote recycle-bin-aware tool is required.');
       const remoteArgs = a.arguments || {};
-      if (/(^|[._-])(shell[._-]?run|process[._-]?start)($|[._-])/i.test(String(a.tool || ''))) assertNoPermanentDeleteCommand(JSON.stringify(remoteArgs), 'remote.call');
+      if (/(^|[._-])(shell[._-]?run|process[._-]?start)($|[._-])/i.test(String(a.tool || ''))) assertSafeMutationCommand(JSON.stringify(remoteArgs), 'remote.call');
       return await remote.call(a.target, a.tool, remoteArgs);
     }
 
@@ -600,6 +675,7 @@ const server = http.createServer((req, res) => {
       protocol: [...PROTOCOL_LEGACY, PROTOCOL_CURRENT],
       oauth: true,
       publicBase: PUBLIC_BASE,
+      mutationFirewall: { enabled: mutationFirewall.enabled, required: mutationFirewall.required },
     });
   }
 
