@@ -1,0 +1,44 @@
+name: Validate Mutation Firewall
+
+on:
+  push:
+    branches:
+      - main
+      - safety/mutation-firewall-v0
+    paths:
+      - 'security/mutation-firewall/**'
+      - '.github/workflows/validate-mutation-firewall.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Build
+        shell: pwsh
+        run: dotnet build security/mutation-firewall/src/MutationFirewall.csproj -c Release
+
+      - name: Deterministic self-test
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force C:\Projects | Out-Null
+          dotnet run --project security/mutation-firewall/src/MutationFirewall.csproj -c Release --no-build -- selftest --policy security/mutation-firewall/ci-policy.json
+
+      - name: Publish self-contained Windows executable
+        shell: pwsh
+        run: dotnet publish security/mutation-firewall/src/MutationFirewall.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o $env:RUNNER_TEMP\mutation-firewall-publish
+
+      - name: Test published executable
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP\mutation-firewall-publish\SentionceMutationFirewall.exe" selftest --policy security/mutation-firewall/ci-policy.json
